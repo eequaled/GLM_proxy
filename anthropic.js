@@ -122,6 +122,7 @@ function resolveModel(anthropicModel) {
 
 /**
  * Convert an Anthropic Messages request body to OpenAI chat/completions format.
+ * Properly translates tool_use → tool_calls, tool_result → "tool" role.
  */
 function anthropicToOpenAI(body, modelId) {
   const messages = [];
@@ -136,29 +137,95 @@ function anthropicToOpenAI(body, modelId) {
 
   // Convert messages
   for (const msg of body.messages || []) {
-    let content = msg.content;
+    const content = msg.content;
 
+    // Simple string content
     if (typeof content === "string") {
       messages.push({ role: msg.role, content });
       continue;
     }
 
-    if (Array.isArray(content)) {
-      const text = content
-        .map((block) => {
-          if (block.type === "text")        return block.text;
-          if (block.type === "tool_result") return `[tool_result id=${block.tool_use_id}]: ${JSON.stringify(block.content)}`;
-          if (block.type === "tool_use")    return `[tool_use id=${block.id} name=${block.name}]: ${JSON.stringify(block.input)}`;
-          if (block.type === "thinking")    return ""; // skip thinking blocks
-          return JSON.stringify(block);
-        })
-        .filter(Boolean)
-        .join("\n");
-      messages.push({ role: msg.role, content: text });
+    if (!Array.isArray(content)) continue;
+
+    // Sort blocks: tool_use and text stay with the message, tool_result becomes "tool" role
+    const toolResults = [];
+    const toolUses = [];
+    const textParts = [];
+
+    for (const block of content) {
+      if (block.type === "tool_result")      toolResults.push(block);
+      else if (block.type === "tool_use")    toolUses.push(block);
+      else if (block.type === "text")        textParts.push(block.text);
+      else if (block.type === "thinking")    { /* skip */ }
+    }
+
+    // tool_result blocks → individual "tool" role messages (must come AFTER the
+    // assistant message that contained the tool_use, which is already in `messages`)
+    for (const tr of toolResults) {
+      let resultText;
+      if (typeof tr.content === "string") {
+        resultText = tr.content;
+      } else if (Array.isArray(tr.content)) {
+        resultText = tr.content
+          .filter((b) => b.type === "text")
+          .map((b) => b.text)
+          .join("\n");
+      } else {
+        resultText = JSON.stringify(tr.content);
+      }
+      messages.push({ role: "tool", tool_call_id: tr.tool_use_id, content: resultText });
+    }
+
+    // Build the main message
+    if (msg.role === "assistant" && toolUses.length > 0) {
+      // Assistant message that called tools — include tool_calls
+      const msgObj = {
+        role: "assistant",
+        tool_calls: toolUses.map((tu) => ({
+          id: tu.id,
+          type: "function",
+          function: { name: tu.name, arguments: JSON.stringify(tu.input) },
+        })),
+      };
+      // Only include content if there's actual text — omitting it entirely is
+      // safer than null/empty-string for picky upstreams
+      if (textParts.length > 0) msgObj.content = textParts.join("\n");
+      messages.push(msgObj);
+    } else if (textParts.length > 0) {
+      // Regular text message
+      messages.push({ role: msg.role, content: textParts.join("\n") });
+    } else if (toolResults.length === 0 && toolUses.length === 0) {
+      // Empty message — shouldn't happen but don't send empty
+      messages.push({ role: msg.role, content: "" });
+    }
+    // If only tool_results: the "tool" messages above are sufficient, skip main msg
+  }
+
+  // Convert Anthropic tool definitions → OpenAI format
+  const openAITools = body.tools?.map((t) => ({
+    type: "function",
+    function: {
+      name: t.name,
+      description: t.description || "",
+      parameters: t.input_schema || { type: "object", properties: {} },
+    },
+  }));
+
+  // Convert tool_choice (only send for explicit choices, let "auto" be the default)
+  let openAIToolChoice;
+  if (body.tool_choice) {
+    if (typeof body.tool_choice === "string") {
+      // "any" → "required", "auto" → don't send (it's the default)
+      if (body.tool_choice === "any") openAIToolChoice = "required";
+      else if (body.tool_choice !== "auto") openAIToolChoice = body.tool_choice;
+    } else if (body.tool_choice?.type === "tool") {
+      openAIToolChoice = { type: "function", function: { name: body.tool_choice.name } };
+    } else if (body.tool_choice?.type === "any") {
+      openAIToolChoice = "required";
     }
   }
 
-  return {
+  const result = {
     model:       modelId,
     messages,
     stream:      true, // always stream upstream
@@ -167,6 +234,10 @@ function anthropicToOpenAI(body, modelId) {
     top_p:       body.top_p       ?? undefined,
     stop:        body.stop_sequences?.length ? body.stop_sequences : undefined,
   };
+  if (openAITools?.length)  result.tools = openAITools;
+  if (openAIToolChoice)     result.tool_choice = openAIToolChoice;
+
+  return result;
 }
 
 /**
@@ -178,6 +249,7 @@ function openAIChunksToAnthropic(raw, modelId, inputTokens) {
   let model = modelId;
   let outputTokens = 0;
   let stopReason = "end_turn";
+  const toolCalls = {}; // index → { id, name, arguments }
 
   for (const line of raw.split("\n")) {
     if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
@@ -188,15 +260,33 @@ function openAIChunksToAnthropic(raw, modelId, inputTokens) {
       const delta = chunk.choices?.[0]?.delta;
       if (delta?.content)           content   += delta.content;
       if (delta?.reasoning_content) reasoning += delta.reasoning_content;
+      // Accumulate tool calls across chunks
+      for (const tc of delta?.tool_calls || []) {
+        if (!toolCalls[tc.index]) toolCalls[tc.index] = { id: "", name: "", arguments: "" };
+        if (tc.id)                  toolCalls[tc.index].id = tc.id;
+        if (tc.function?.name)      toolCalls[tc.index].name = tc.function.name;
+        if (tc.function?.arguments) toolCalls[tc.index].arguments += tc.function.arguments;
+      }
       const fr = chunk.choices?.[0]?.finish_reason;
       if (fr === "length") stopReason = "max_tokens";
+      if (fr === "tool_calls") stopReason = "tool_use";
       if (chunk.usage) outputTokens = chunk.usage.completion_tokens ?? 0;
     } catch { /* skip malformed lines */ }
   }
 
   const contentBlocks = [];
   if (reasoning) contentBlocks.push({ type: "thinking", thinking: reasoning });
-  contentBlocks.push({ type: "text", text: content });
+
+  // Emit tool_use blocks (sorted by index)
+  const sortedIndices = Object.keys(toolCalls).sort((a, b) => Number(a) - Number(b));
+  for (const idx of sortedIndices) {
+    const tc = toolCalls[idx];
+    let input = {};
+    try { input = JSON.parse(tc.arguments); } catch { /* partial JSON */ }
+    contentBlocks.push({ type: "tool_use", id: tc.id, name: tc.name, input });
+  }
+
+  if (content) contentBlocks.push({ type: "text", text: content });
 
   return {
     id,
@@ -215,12 +305,21 @@ function openAIChunksToAnthropic(raw, modelId, inputTokens) {
 
 /**
  * Convert a single OpenAI SSE line to one or more Anthropic SSE event strings.
+ * Handles streaming tool_calls → Anthropic tool_use content blocks.
  */
 function openAIChunkToAnthropicEvents(line, state) {
   if (!line.startsWith("data: ")) return [];
 
   if (line === "data: [DONE]") {
     const events = [];
+    // Close any open tool_use blocks
+    for (const idx of Object.keys(state.toolState).sort((a, b) => Number(a) - Number(b))) {
+      const ts = state.toolState[idx];
+      if (ts.opened && !ts.closed) {
+        events.push(fmt("content_block_stop", { type: "content_block_stop", index: ts.blockIdx }));
+        ts.closed = true;
+      }
+    }
     if (state.blockOpen) {
       events.push(fmt("content_block_stop", { type: "content_block_stop", index: state.blockIndex }));
       state.blockOpen = false;
@@ -243,17 +342,60 @@ function openAIChunkToAnthropicEvents(line, state) {
   const events    = [];
   const content   = delta.content           ?? "";
   const reasoning = delta.reasoning_content ?? "";
+  const toolCalls = delta.tool_calls        || [];
   const fr        = chunk.choices?.[0]?.finish_reason;
 
   if (chunk.usage) state.outputTokens = chunk.usage.completion_tokens ?? state.outputTokens;
-  if (fr === "length") state.finishReason = "max_tokens";
-  if (fr === "stop")   state.finishReason = "end_turn";
+  if (fr === "length")     state.finishReason = "max_tokens";
+  if (fr === "stop")       state.finishReason = "end_turn";
+  if (fr === "tool_calls") state.finishReason = "tool_use";
 
-  // Open thinking block on first reasoning chunk
+  // ---- Tool calls ----
+  for (const tc of toolCalls) {
+    const idx = tc.index;
+    if (!state.toolState[idx]) {
+      state.toolState[idx] = { id: "", name: "", arguments: "", opened: false, closed: false, blockIdx: -1 };
+    }
+    const ts = state.toolState[idx];
+    if (tc.id)                  ts.id = tc.id;
+    if (tc.function?.name)      ts.name = tc.function.name;
+    if (tc.function?.arguments) ts.arguments += tc.function.arguments;
+
+    // Open the tool_use block once we have the name
+    if (ts.name && !ts.opened) {
+      // Close any currently open block first
+      if (state.blockOpen) {
+        events.push(fmt("content_block_stop", { type: "content_block_stop", index: state.blockIndex }));
+        state.blockIndex++;
+        state.blockOpen = false;
+        state.thinkingOpen = false;
+        state.textOpen = false;
+      }
+      ts.blockIdx = state.blockIndex;
+      events.push(fmt("content_block_start", {
+        type: "content_block_start", index: state.blockIndex,
+        content_block: { type: "tool_use", id: ts.id, name: ts.name, input: {} },
+      }));
+      ts.opened = true;
+      state.blockOpen = true;
+    }
+
+    // Stream the arguments as input_json_delta
+    if (ts.opened && tc.function?.arguments) {
+      events.push(fmt("content_block_delta", {
+        type: "content_block_delta", index: ts.blockIdx,
+        delta: { type: "input_json_delta", partial_json: tc.function.arguments },
+      }));
+    }
+  }
+
+  // ---- Reasoning ----
   if (reasoning && !state.thinkingOpen) {
     if (state.blockOpen) {
       events.push(fmt("content_block_stop", { type: "content_block_stop", index: state.blockIndex }));
       state.blockIndex++;
+      state.blockOpen = false;
+      state.textOpen = false;
     }
     events.push(fmt("content_block_start", {
       type: "content_block_start", index: state.blockIndex,
@@ -270,22 +412,33 @@ function openAIChunkToAnthropicEvents(line, state) {
     }));
   }
 
-  // Open text block on first content chunk (closing thinking block first if needed)
+  // ---- Text ----
   if (content && !state.textOpen) {
+    // Close thinking block if open
     if (state.thinkingOpen) {
       events.push(fmt("content_block_stop", { type: "content_block_stop", index: state.blockIndex }));
       state.blockIndex++;
       state.thinkingOpen = false;
-    } else if (state.blockOpen) {
-      events.push(fmt("content_block_stop", { type: "content_block_stop", index: state.blockIndex }));
-      state.blockIndex++;
+      state.blockOpen = false;
     }
-    events.push(fmt("content_block_start", {
-      type: "content_block_start", index: state.blockIndex,
-      content_block: { type: "text", text: "" },
-    }));
-    state.textOpen  = true;
-    state.blockOpen = true;
+    // Close any open tool_use blocks before starting text
+    for (const idx of Object.keys(state.toolState).sort((a, b) => Number(a) - Number(b))) {
+      const ts = state.toolState[idx];
+      if (ts.opened && !ts.closed) {
+        events.push(fmt("content_block_stop", { type: "content_block_stop", index: ts.blockIdx }));
+        state.blockIndex++;
+        ts.closed = true;
+        state.blockOpen = false;
+      }
+    }
+    if (!state.blockOpen) {
+      events.push(fmt("content_block_start", {
+        type: "content_block_start", index: state.blockIndex,
+        content_block: { type: "text", text: "" },
+      }));
+      state.textOpen  = true;
+      state.blockOpen = true;
+    }
   }
 
   if (content) {
@@ -310,6 +463,7 @@ function callUpstream(modelId, openAIBody) {
   return new Promise((resolve, reject) => {
     const token   = getToken();
     const payload = JSON.stringify(openAIBody);
+    log.debug("→ upstream payload:", payload);
     const options = {
       hostname: "autoglm-api.autoglm.ai",
       path:     "/autoclaw-proxy/proxy/autoclaw/v1/chat/completions",
@@ -449,6 +603,7 @@ async function handleMessages(req, res) {
       blockIndex: 0, blockOpen: false,
       thinkingOpen: false, textOpen: false,
       outputTokens: 0, finishReason: "end_turn",
+      toolState: {},
     };
 
     let buffer = "";
