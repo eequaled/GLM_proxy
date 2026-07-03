@@ -1,0 +1,10 @@
+{
+  "name": "autoclaw-gateway",
+  "version": "2.0.0",
+  "description": "OpenAI-compatible proxy for AutoClaw's API — same approach as antigravity-claude-proxy",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "start": "node main.js"
+  }
+}
