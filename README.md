@@ -28,7 +28,6 @@ Make sure **AutoClaw is running and you're logged in**. The proxy reads auth fro
 <p align="center">
   <i>Screenshot: AutoClaw desktop app running and logged in (background service)</i>
   <br>
-  <!-- Replace with your screenshot -->
   <img src="./screenshots/autoclaw-background.png" alt="AutoClaw running as background service" width="700">
 </p>
 
@@ -39,7 +38,6 @@ Start the proxy and watch it handle requests from your tool of choice:
 <p align="center">
   <i>Screenshot: Terminal showing <code>node main.js</code> startup with "Token loaded — ready", then requests being proxied through</i>
   <br>
-  <!-- Replace with your screenshot -->
   <img src="./screenshots/proxy-working.png" alt="Proxy terminal showing successful operation" width="700">
 </p>
 
@@ -54,7 +52,7 @@ AutoClaw handles authentication automatically. As long as AutoClaw is running an
 
 ## Prerequisites
 
-- [AutoClaw](https://autoclaw.com) installed, running, and logged in
+- [AutoClaw](https://autoclaw.com) installed, running, and logged in (Windows / macOS only)
 - Node.js 18+
 
 ## Quick Start

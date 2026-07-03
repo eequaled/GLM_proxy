@@ -17,7 +17,7 @@
  *
  * OpenCode / any OpenAI-compatible client:
  *   baseURL : http://localhost:18791/v1
- *   apiKey  : (value of PROXY_KEY env, default "sk-autoclaw")
+ *   apiKey  : (value of PROXY_KEY env, default "mewmew")
  */
 
 import http from "http";
@@ -184,6 +184,7 @@ function bufferSSE(upstreamRes, modelId) {
         let model   = modelId;
         let promptTokens = 0, completionTokens = 0;
         let finishReason = "stop";
+        const toolCalls = {};
 
         for (const line of raw.split("\n")) {
           if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
@@ -193,6 +194,13 @@ function bufferSSE(upstreamRes, modelId) {
           const delta = chunk.choices?.[0]?.delta;
           if (delta?.content)          content   += delta.content;
           if (delta?.reasoning_content) reasoning += delta.reasoning_content;
+          // Accumulate tool calls
+          for (const tc of delta?.tool_calls || []) {
+            if (!toolCalls[tc.index]) toolCalls[tc.index] = { id: "", name: "", arguments: "" };
+            if (tc.id)                  toolCalls[tc.index].id = tc.id;
+            if (tc.function?.name)      toolCalls[tc.index].name = tc.function.name;
+            if (tc.function?.arguments) toolCalls[tc.index].arguments += tc.function.arguments;
+          }
           const fr = chunk.choices?.[0]?.finish_reason;
           if (fr) finishReason = fr;
           if (chunk.usage) {
@@ -200,6 +208,18 @@ function bufferSSE(upstreamRes, modelId) {
             completionTokens = chunk.usage.completion_tokens ?? 0;
           }
         }
+
+        // Build sorted tool_calls array
+        const sortedToolCalls = Object.keys(toolCalls)
+          .sort((a, b) => Number(a) - Number(b))
+          .map((idx) => {
+            const tc = toolCalls[idx];
+            return {
+              id: tc.id,
+              type: "function",
+              function: { name: tc.name, arguments: tc.arguments },
+            };
+          });
 
         resolve({
           id,
@@ -212,6 +232,7 @@ function bufferSSE(upstreamRes, modelId) {
               role:    "assistant",
               content,
               ...(reasoning ? { reasoning_content: reasoning } : {}),
+              ...(sortedToolCalls.length ? { tool_calls: sortedToolCalls } : {}),
             },
             finish_reason: finishReason,
           }],
