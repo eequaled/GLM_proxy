@@ -217,6 +217,12 @@ Any tool that supports OpenAI-compatible providers works. Point it at `http://lo
 - If a request fails with 401, the proxy automatically refreshes its auth and you can retry immediately
 - No dependencies beyond Node.js built-in modules — zero `node_modules`, zero install step
 
+## Special Thanks
+
+<p align="center">
+  <img src="./screenshots/jarona.png" alt="Special thanks to Jarona" width="200">
+</p>
+
 ## License
 
-MIT
+MIT License + Jarona Rights™ (sorry to keep u waiting)
