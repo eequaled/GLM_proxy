@@ -70,13 +70,14 @@ const MODELS = [
     contextWindow: 204_800,
     maxTokens:     131_072,
   },
-  {
-    id:            "openrouter_glm-5.2",
-    name:          "GLM-5.2",
-    description:   "Latest GLM-5.2 via OpenRouter",
-    contextWindow: 1_048_576,
-    maxTokens:     307_200,
-  },
+  // ── DEPRECATED (Z.AI deprecated GLM-5.2 from the AutoClaw app) ───────────────
+  // {
+  //   id:            "openrouter_glm-5.2",
+  //   name:          "GLM-5.2",
+  //   description:   "Latest GLM-5.2 via OpenRouter",
+  //   contextWindow: 1_048_576,
+  //   maxTokens:     307_200,
+  // },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -166,7 +167,43 @@ function invalidateToken() {
 function callUpstream(modelId, requestBody) {
   return new Promise((resolve, reject) => {
     const token   = getToken();
-    const payload = JSON.stringify({ ...requestBody, model: modelId, stream: true });
+    // The backend ONLY accepts the original 'zai_' prefixed model string.
+    // E.g., 'zai_auto' or 'zai_glm-5-turbo'. Do NOT strip the 'zai_' prefix!
+    // But OpenCode uses "auto", so map "auto" back to "zai_auto".
+    const upstreamModelId = modelId === "auto" ? "zai_auto" : (modelId.startsWith("zai_") ? modelId : `zai_${modelId}`);
+
+    // Normalize messages: some clients (like Trae) send `content` as an array of text objects,
+    // which AutoClaw/Zhipu's backend often rejects with "parse response failed" (500).
+    const normalizedMessages = (requestBody.messages || []).map(msg => {
+      const newMsg = { ...msg };
+      
+      // Fix 1: Flatten content array if it exists
+      if (Array.isArray(newMsg.content)) {
+        const allText = newMsg.content.every(c => c.type === "text");
+        if (allText) {
+          newMsg.content = newMsg.content.map(c => c.text).join("\n");
+        }
+      }
+      
+      return newMsg;
+    });
+
+    const sanitizedBody = {
+      ...requestBody,
+      messages: normalizedMessages,
+      model: upstreamModelId, // 500 error if this isn't strictly prefixed
+      stream: true
+    };
+
+    // Remove fields that Zhipu strictly rejects if present
+    delete sanitizedBody.stream_options;
+
+    // DEBUG: print the exact payload OpenCode sent
+    log.debug("=== OPENCODE PAYLOAD ===");
+    log.debug(JSON.stringify(sanitizedBody, null, 2));
+    log.debug("========================");
+
+    const payload = JSON.stringify(sanitizedBody);
 
     const options = {
       hostname: "autoglm-api.autoglm.ai",
@@ -176,7 +213,7 @@ function callUpstream(modelId, requestBody) {
         "Content-Type":    "application/json",
         "Content-Length":  Buffer.byteLength(payload),
         "X-Authorization": token,
-        "X-Request-Model": modelId,
+        "X-Request-Model": upstreamModelId,
         ...CLIENT_HEADERS,
       },
       timeout: 120_000, // 2 min timeout for upstream
@@ -386,8 +423,10 @@ async function handleChatCompletions(req, res) {
         log.error(`Upstream error ${upstreamRes.statusCode}:`, parsed.error?.message || errBody);
         sendJSON(res, parsed, upstreamRes.statusCode);
       } catch {
-        log.error(`Upstream error ${upstreamRes.statusCode}:`, errBody);
-        sendError(res, errBody || "Upstream error", "api_error", upstreamRes.statusCode);
+        // Response wasn't JSON (e.g., nginx HTML error like 413)
+        const cleanMsg = errBody.match(/<title>(.*?)<\/title>/i)?.[1] || errBody || "Upstream error";
+        log.error(`Upstream error ${upstreamRes.statusCode}:`, cleanMsg);
+        sendError(res, cleanMsg, "api_error", upstreamRes.statusCode);
       }
     });
     return;

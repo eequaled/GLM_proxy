@@ -12,6 +12,10 @@
 
 ---
 
+> ⚠️ **Important Alert:** Z.AI has deprecated `glm-5.2` from the AutoClaw app. The proxy will no longer be able to route requests to it. Please use `zai_auto` or `zai_glm-5-turbo` instead.
+
+---
+
 Two files, pick what matches your tool:
 
 | File | Format | Port | Use with |
