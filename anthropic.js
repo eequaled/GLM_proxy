@@ -95,6 +95,23 @@ const log = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Request log file  (keeps last N requests on disk, not in terminal)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ANTHROPIC_LOG_FILE = path.join(process.cwd(), "proxy_requests_anthropic.json");
+const MAX_LOG_ENTRIES     = 50;
+
+function logRequest(entry) {
+  try {
+    let entries = [];
+    try { entries = JSON.parse(fs.readFileSync(ANTHROPIC_LOG_FILE, "utf-8")); } catch (_) {}
+    entries.push(entry);
+    if (entries.length > MAX_LOG_ENTRIES) entries = entries.slice(-MAX_LOG_ENTRIES);
+    fs.writeFileSync(ANTHROPIC_LOG_FILE, JSON.stringify(entries, null, 2));
+  } catch (_) { /* silently skip if disk write fails */ }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Token layer  (identical to main.js)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -488,7 +505,6 @@ function callUpstream(modelId, openAIBody) {
     // Do NOT strip the 'zai_' prefix — causes 500 "parse response failed".
     const upstreamModelId = modelId;
     const payload = JSON.stringify({ ...openAIBody, model: upstreamModelId });
-    log.debug("→ upstream payload:", payload);
     const options = {
       hostname: "autoglm-api.autoglm.ai",
       path:     "/autoclaw-proxy/proxy/autoclaw/v1/chat/completions",
@@ -594,6 +610,19 @@ async function handleMessages(req, res) {
   }
 
   log.debug(`upstream status=${upstreamRes.statusCode}`);
+
+  // Save request details + status to file (not terminal)
+  const lastMsg = openAIBody.messages?.[openAIBody.messages.length - 1];
+  logRequest({
+    timestamp: new Date().toISOString(),
+    model: modelId,
+    anthropic_model: body.model,
+    status: upstreamRes.statusCode,
+    last_message: typeof lastMsg?.content === "string"
+      ? lastMsg.content.substring(0, 300)
+      : JSON.stringify(lastMsg?.content).substring(0, 300),
+    message_count: openAIBody.messages?.length || 0,
+  });
 
   if (upstreamRes.statusCode === 401) {
     invalidateToken();

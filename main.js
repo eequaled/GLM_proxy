@@ -113,6 +113,23 @@ const log = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Request log file  (keeps last N requests on disk, not in terminal)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const REQUEST_LOG_FILE = path.join(process.cwd(), "proxy_requests.json");
+const MAX_LOG_ENTRIES   = 50;
+
+function logRequest(entry) {
+  try {
+    let entries = [];
+    try { entries = JSON.parse(fs.readFileSync(REQUEST_LOG_FILE, "utf-8")); } catch (_) {}
+    entries.push(entry);
+    if (entries.length > MAX_LOG_ENTRIES) entries = entries.slice(-MAX_LOG_ENTRIES);
+    fs.writeFileSync(REQUEST_LOG_FILE, JSON.stringify(entries, null, 2));
+  } catch (_) { /* silently skip if disk write fails */ }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Token layer  (mirrors acc's token-extractor.js)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -197,11 +214,6 @@ function callUpstream(modelId, requestBody) {
 
     // Remove fields that Zhipu strictly rejects if present
     delete sanitizedBody.stream_options;
-
-    // DEBUG: print the exact payload OpenCode sent
-    log.debug("=== OPENCODE PAYLOAD ===");
-    log.debug(JSON.stringify(sanitizedBody, null, 2));
-    log.debug("========================");
 
     const payload = JSON.stringify(sanitizedBody);
 
@@ -403,6 +415,18 @@ async function handleChatCompletions(req, res) {
   }
 
   log.debug(`← upstream status=${upstreamRes.statusCode}`);
+
+  // Save request details + status to file (not terminal)
+  const lastMsg = body.messages?.[body.messages.length - 1];
+  logRequest({
+    timestamp: new Date().toISOString(),
+    model: modelId,
+    status: upstreamRes.statusCode,
+    last_message: typeof lastMsg?.content === "string"
+      ? lastMsg.content.substring(0, 300)
+      : JSON.stringify(lastMsg?.content).substring(0, 300),
+    message_count: body.messages?.length || 0,
+  });
 
   // 401 → invalidate cached token so next request gets a fresh one
   if (upstreamRes.statusCode === 401) {
