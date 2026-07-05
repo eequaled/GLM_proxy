@@ -65,11 +65,32 @@ const MODELS = [
 // Logger
 // ─────────────────────────────────────────────────────────────────────────────
 
+const COLORS = {
+  RESET: '\x1b[0m',
+  RED: '\x1b[31m',
+  GREEN: '\x1b[32m',
+  YELLOW: '\x1b[33m',
+  BLUE: '\x1b[34m',
+  MAGENTA: '\x1b[35m',
+  CYAN: '\x1b[36m',
+  GRAY: '\x1b[90m'
+};
+
+const formatLog = (level, color, ...args) => {
+  const timestamp = new Date().toISOString();
+  return [
+    `${COLORS.GRAY}[${timestamp}]${COLORS.RESET}`,
+    `${color}[${level}]${COLORS.RESET}`,
+    ...args
+  ];
+};
+
 const log = {
-  debug: (...a) => LOG_LEVEL === "debug" && console.log("[debug]", ...a),
-  info:  (...a) => LOG_LEVEL !== "silent" && console.log("[info] ", ...a),
-  warn:  (...a) => LOG_LEVEL !== "silent" && console.warn("[warn] ", ...a),
-  error: (...a) => console.error("[error]", ...a),
+  debug: (...a) => LOG_LEVEL === "debug" && console.log(...formatLog('DEBUG', COLORS.MAGENTA, ...a)),
+  info:  (...a) => LOG_LEVEL !== "silent" && console.log(...formatLog('INFO', COLORS.BLUE, ...a)),
+  warn:  (...a) => LOG_LEVEL !== "silent" && console.warn(...formatLog('WARN', COLORS.YELLOW, ...a)),
+  error: (...a) => console.error(...formatLog('ERROR', COLORS.RED, ...a)),
+  success: (...a) => LOG_LEVEL !== "silent" && console.log(...formatLog('SUCCESS', COLORS.GREEN, ...a)),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -475,8 +496,13 @@ function callUpstream(modelId, openAIBody) {
         "X-Request-Model": modelId,
         ...CLIENT_HEADERS,
       },
+      timeout: 120_000, // 2 min timeout for upstream
     };
     const req = https.request(options, resolve);
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Upstream timeout — AutoClaw backend did not respond within 2 minutes"));
+    });
     req.on("error", reject);
     req.write(payload);
     req.end();
@@ -574,8 +600,14 @@ async function handleMessages(req, res) {
     let errBody = "";
     upstreamRes.on("data", (c) => (errBody += c));
     upstreamRes.on("end",  () => {
-      try   { sendJSON(res, JSON.parse(errBody), upstreamRes.statusCode); }
-      catch { sendError(res, errBody || "Upstream error", "api_error", upstreamRes.statusCode); }
+      try {
+        const parsed = JSON.parse(errBody);
+        log.error(`Upstream error ${upstreamRes.statusCode}:`, parsed.error?.message || errBody);
+        sendJSON(res, parsed, upstreamRes.statusCode);
+      } catch {
+        log.error(`Upstream error ${upstreamRes.statusCode}:`, errBody);
+        sendError(res, errBody || "Upstream error", "api_error", upstreamRes.statusCode);
+      }
     });
     return;
   }
