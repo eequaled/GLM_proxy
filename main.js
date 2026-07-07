@@ -59,7 +59,7 @@ const MODELS = [
   {
     id:            "zai_auto",
     name:          "Auto",
-    description:   "Smart Select — routes to optimal model (GLM-5.1, DeepSeek-V4, GLM-Air, …)",
+    description:   "Smart Select — routes to optimal model (DeepSeek-V4, GLM-5.1, GLM-5-turbo, …)",
     contextWindow: 1_048_576,
     maxTokens:     393_216,
   },
@@ -70,14 +70,13 @@ const MODELS = [
     contextWindow: 204_800,
     maxTokens:     131_072,
   },
-  // ── DEPRECATED (Z.AI deprecated GLM-5.2 from the AutoClaw app) ───────────────
-  // {
-  //   id:            "openrouter_glm-5.2",
-  //   name:          "GLM-5.2",
-  //   description:   "Latest GLM-5.2 via OpenRouter",
-  //   contextWindow: 1_048_576,
-  //   maxTokens:     307_200,
-  // },
+  {
+    id:            "openrouter_glm-5.2",
+    name:          "GLM-5.2",
+    description:   "Latest GLM-5.2 via OpenRouter",
+    contextWindow: 1_048_576,
+    maxTokens:     307_200,
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,7 +186,9 @@ function callUpstream(modelId, requestBody) {
     // The backend ONLY accepts the original 'zai_' prefixed model string.
     // E.g., 'zai_auto' or 'zai_glm-5-turbo'. Do NOT strip the 'zai_' prefix!
     // But OpenCode uses "auto", so map "auto" back to "zai_auto".
-    const upstreamModelId = modelId === "auto" ? "zai_auto" : (modelId.startsWith("zai_") ? modelId : `zai_${modelId}`);
+    const upstreamModelId = modelId === "auto" ? "zai_auto"
+      : modelId.startsWith("zai_") || modelId.startsWith("openrouter_") ? modelId
+      : `zai_${modelId}`;
 
     // Normalize messages: some clients (like Trae) send `content` as an array of text objects,
     // which AutoClaw/Zhipu's backend often rejects with "parse response failed" (500).

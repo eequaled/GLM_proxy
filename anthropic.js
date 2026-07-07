@@ -48,9 +48,9 @@ const CLIENT_HEADERS = {
 // works automatically without needing updates to this file.
 // You can also override per-model via ANTHROPIC_DEFAULT_OPUS_MODEL etc. in Claude Code settings.
 const CLASS_MAP = [
-  { pattern: /opus/i,   target: "zai_auto"            }, // Opus class   - highest capability (was openrouter_glm-5.2, now deprecated)
-  { pattern: /sonnet/i, target: "zai_auto"            }, // Sonnet class - smart select
-  { pattern: /haiku/i,  target: "zai_glm-5-turbo"    }, // Haiku class  - fastest
+  { pattern: /opus/i,   target: "openrouter_glm-5.2"   }, // Opus class   - highest capability
+  { pattern: /sonnet/i, target: "zai_auto"               }, // Sonnet class - smart select
+  { pattern: /haiku/i,  target: "zai_glm-5-turbo"       }, // Haiku class  - fastest
 ];
 
 const DEFAULT_MODEL = "zai_auto";
@@ -58,8 +58,7 @@ const DEFAULT_MODEL = "zai_auto";
 const MODELS = [
   { id: "zai_auto",           name: "Auto",        contextWindow: 1_048_576, maxTokens: 393_216 },
   { id: "zai_glm-5-turbo",    name: "GLM-5-Turbo", contextWindow: 204_800,   maxTokens: 131_072 },
-  // ── DEPRECATED (Z.AI deprecated GLM-5.2 from the AutoClaw app) ───────────────
-  // { id: "openrouter_glm-5.2", name: "GLM-5.2",     contextWindow: 1_048_576, maxTokens: 307_200 },
+  { id: "openrouter_glm-5.2", name: "GLM-5.2",     contextWindow: 1_048_576, maxTokens: 307_200 },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
