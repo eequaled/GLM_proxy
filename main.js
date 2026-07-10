@@ -71,9 +71,9 @@ const MODELS = [
     maxTokens:     131_072,
   },
   {
-    id:            "openrouter_glm-5.2",
+    id:            "zaicoding_glm-5.2",
     name:          "GLM-5.2",
-    description:   "Latest GLM-5.2 via OpenRouter",
+    description:   "Latest GLM-5.2 via Zhipu",
     contextWindow: 1_048_576,
     maxTokens:     307_200,
   },
@@ -183,11 +183,12 @@ function invalidateToken() {
 function callUpstream(modelId, requestBody) {
   return new Promise((resolve, reject) => {
     const token   = getToken();
-    // The backend ONLY accepts the original 'zai_' prefixed model string.
-    // E.g., 'zai_auto' or 'zai_glm-5-turbo'. Do NOT strip the 'zai_' prefix!
+    // The backend ONLY accepts the original model string with prefix.
+    // E.g., 'zai_auto', 'zaicoding_glm-5.2', 'zai_glm-5-turbo'.
+    // Do NOT strip the prefix! Do NOT convert between prefixes!
     // But OpenCode uses "auto", so map "auto" back to "zai_auto".
     const upstreamModelId = modelId === "auto" ? "zai_auto"
-      : modelId.startsWith("zai_") || modelId.startsWith("openrouter_") ? modelId
+      : modelId.startsWith("zai_") || modelId.startsWith("zaicoding_") ? modelId
       : `zai_${modelId}`;
 
     // Normalize messages: some clients (like Trae) send `content` as an array of text objects,
