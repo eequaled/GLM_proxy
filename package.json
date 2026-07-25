@@ -1,10 +1,25 @@
 {
   "name": "autoclaw-gateway",
   "version": "1.0.0",
-  "description": "OpenAI-compatible proxy for AutoClaw's API — same approach as antigravity-claude-proxy",
+  "description": "OpenAI & Anthropic compatible proxy for AutoClaw's Zhipu AI backend",
   "main": "main.js",
   "type": "module",
+  "bin": {
+    "autoclaw-gateway": "./bin/cli.js",
+    "autoclaw-proxy": "./bin/cli.js"
+  },
   "scripts": {
-    "start": "node main.js"
-  }
+    "start": "node main.js",
+    "anthropic": "node anthropic.js"
+  },
+  "keywords": [
+    "autoclaw",
+    "openai",
+    "anthropic",
+    "proxy",
+    "gateway",
+    "opencode",
+    "claude-code"
+  ],
+  "license": "MIT"
 }
