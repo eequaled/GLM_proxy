@@ -44,22 +44,61 @@ const CLIENT_HEADERS = {
   "X-Lang":    "en",
 };
 
-// Model class routing - regex-based so any future claude-opus-X / sonnet-X / haiku-X
-// works automatically without needing updates to this file.
-// You can also override per-model via ANTHROPIC_DEFAULT_OPUS_MODEL etc. in Claude Code settings.
-const CLASS_MAP = [
-  { pattern: /opus/i,   target: "zaicoding_glm-5.2"    }, // Opus class   - highest capability
-  { pattern: /sonnet/i, target: "zai_auto"               }, // Sonnet class - smart select
-  { pattern: /haiku/i,  target: "zai_glm-5-turbo"       }, // Haiku class  - fastest
-];
+// ─────────────────────────────────────────────────────────────────────────────
+// Model catalog — auto-healed from AutoClaw's runtime config
+// ─────────────────────────────────────────────────────────────────────────────
 
-const DEFAULT_MODEL = "zai_auto";
+const RUNTIME_FILE      = path.join(os.homedir(), ".openclaw-autoclaw", "openclaw.runtime.json");
+const RUNTIME_LAST_GOOD = path.join(os.homedir(), ".openclaw-autoclaw", "openclaw.runtime.json.last-good");
+const RUNTIME_CANDIDATES = [RUNTIME_FILE, RUNTIME_LAST_GOOD];
 
-const MODELS = [
+const FALLBACK_MODELS = [
   { id: "zai_auto",           name: "Auto",        contextWindow: 1_048_576, maxTokens: 393_216 },
   { id: "zai_glm-5-turbo",    name: "GLM-5-Turbo", contextWindow: 204_800,   maxTokens: 131_072 },
-  { id: "zaicoding_glm-5.2", name: "GLM-5.2",     contextWindow: 1_048_576, maxTokens: 307_200 },
+  { id: "zaicoding_glm-5.2",  name: "GLM-5.2",     contextWindow: 1_048_576, maxTokens: 307_200 },
 ];
+
+function loadModelsFromRuntime() {
+  for (const candidate of RUNTIME_CANDIDATES) {
+    try {
+      const raw  = fs.readFileSync(candidate, "utf-8");
+      const data = JSON.parse(raw);
+      const rawModels = data?.models?.providers?.zai?.models;
+      if (!Array.isArray(rawModels) || rawModels.length === 0) continue;
+
+      const models = rawModels.map((m) => ({
+        id:            m.id,
+        name:          m.name || m.id,
+        contextWindow: m.contextWindow || 1_048_576,
+        maxTokens:     m.maxTokens     || 131_072,
+      }));
+
+      console.log(`  📋  Loaded ${models.length} model(s) from ${path.basename(candidate)}`);
+      return models;
+    } catch (_) { /* try next candidate */ }
+  }
+  console.warn("  ⚠️   Could not read runtime models — using built-in fallback");
+  return FALLBACK_MODELS;
+}
+
+const MODELS       = loadModelsFromRuntime();
+const KNOWN_IDS    = new Set(MODELS.map((m) => m.id));
+
+// Resolve model roles dynamically from the loaded catalog
+const findById = (id)   => MODELS.find((m) => m.id === id);
+const findByName = (s)  => MODELS.find((m) => m.name.toLowerCase().includes(s.toLowerCase()));
+const opusModel   = MODELS.length >= 3 ? MODELS[MODELS.length - 1].id   // last = most advanced
+                    : findByName("5.2")?.id || findByName("glm-5")?.id || "zai_auto";
+const sonnetModel = findById("zai_auto")?.id     || "zai_auto";
+const haikuModel  = findById("zai_glm-5-turbo")?.id || findByName("turbo")?.id || "zai_glm-5-turbo";
+
+const CLASS_MAP = [
+  { pattern: /opus/i,   target: opusModel   }, // highest capability
+  { pattern: /sonnet/i, target: sonnetModel }, // smart select
+  { pattern: /haiku/i,  target: haikuModel  }, // fastest
+];
+
+const DEFAULT_MODEL = sonnetModel;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Logger

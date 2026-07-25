@@ -52,32 +52,48 @@ const CLIENT_HEADERS = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Model catalog  (sourced from ~/.openclaw-autoclaw/openclaw.runtime.json)
+// Model catalog — auto-healed from AutoClaw's runtime config
 // ─────────────────────────────────────────────────────────────────────────────
 
-const MODELS = [
-  {
-    id:            "zai_auto",
-    name:          "Auto",
-    description:   "Smart Select — routes to optimal model (DeepSeek-V4, GLM-5.1, GLM-5-turbo, …)",
-    contextWindow: 1_048_576,
-    maxTokens:     393_216,
-  },
-  {
-    id:            "zai_glm-5-turbo",
-    name:          "GLM-5-Turbo",
-    description:   "Zhipu AI GLM-5 Turbo with extended reasoning",
-    contextWindow: 204_800,
-    maxTokens:     131_072,
-  },
-  {
-    id:            "zaicoding_glm-5.2",
-    name:          "GLM-5.2",
-    description:   "Latest GLM-5.2 via Zhipu",
-    contextWindow: 1_048_576,
-    maxTokens:     307_200,
-  },
+const RUNTIME_FILE      = path.join(os.homedir(), ".openclaw-autoclaw", "openclaw.runtime.json");
+const RUNTIME_LAST_GOOD = path.join(os.homedir(), ".openclaw-autoclaw", "openclaw.runtime.json.last-good");
+// Ordered fallbacks — try newest first, degrade gracefully
+const RUNTIME_CANDIDATES = [RUNTIME_FILE, RUNTIME_LAST_GOOD];
+
+/** Hardcoded last-resort fallback in case all runtime files are unreadable. */
+const FALLBACK_MODELS = [
+  { id: "zai_auto",           name: "Auto",        contextWindow: 1_048_576, maxTokens: 393_216 },
+  { id: "zai_glm-5-turbo",    name: "GLM-5-Turbo", contextWindow: 204_800,   maxTokens: 131_072 },
+  { id: "zaicoding_glm-5.2",  name: "GLM-5.2",     contextWindow: 1_048_576, maxTokens: 307_200 },
 ];
+
+function loadModelsFromRuntime() {
+  for (const candidate of RUNTIME_CANDIDATES) {
+    try {
+      const raw  = fs.readFileSync(candidate, "utf-8");
+      const data = JSON.parse(raw);
+      const rawModels = data?.models?.providers?.zai?.models;
+      if (!Array.isArray(rawModels) || rawModels.length === 0) continue;
+
+      const models = rawModels.map((m) => ({
+        id:            m.id,
+        name:          m.name || m.id,
+        contextWindow: m.contextWindow || 1_048_576,
+        maxTokens:     m.maxTokens     || 131_072,
+      }));
+
+      console.log(`  📋  Loaded ${models.length} model(s) from ${path.basename(candidate)}`);
+      return models;
+    } catch (_) { /* try next candidate */ }
+  }
+
+  // Nothing worked — use hardcoded fallback
+  console.warn("  ⚠️   Could not read runtime models — using built-in fallback");
+  return FALLBACK_MODELS;
+}
+
+const MODELS       = loadModelsFromRuntime();
+const KNOWN_IDS    = new Set(MODELS.map((m) => m.id));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Logger
@@ -184,11 +200,10 @@ function callUpstream(modelId, requestBody) {
   return new Promise((resolve, reject) => {
     const token   = getToken();
     // The backend ONLY accepts the original model string with prefix.
-    // E.g., 'zai_auto', 'zaicoding_glm-5.2', 'zai_glm-5-turbo'.
-    // Do NOT strip the prefix! Do NOT convert between prefixes!
-    // But OpenCode uses "auto", so map "auto" back to "zai_auto".
-    const upstreamModelId = modelId === "auto" ? "zai_auto"
-      : modelId.startsWith("zai_") || modelId.startsWith("zaicoding_") ? modelId
+    // Pass through known model IDs as-is. Map "auto" → "zai_auto".
+    // Everything else gets "zai_" prepended as a best-effort fallback.
+    const upstreamModelId = KNOWN_IDS.has(modelId) ? modelId
+      : modelId === "auto" ? "zai_auto"
       : `zai_${modelId}`;
 
     // Normalize messages: some clients (like Trae) send `content` as an array of text objects,
@@ -393,7 +408,7 @@ function handleModels(res) {
       created:        Math.floor(Date.now() / 1000),
       owned_by:       "autoclaw",
       name:           m.name,
-      description:    m.description,
+      description:    m.name,
       context_window: m.contextWindow,
       max_tokens:     m.maxTokens,
     })),
