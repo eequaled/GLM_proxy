@@ -124,11 +124,25 @@ All models include `reasoning_content` in responses when the upstream model reas
 
 ```json
 {
-  "providers": {
+  "provider": {
     "autoclaw": {
-      "type": "openai-compatible",
-      "baseURL": "http://localhost:18791/v1",
-      "apiKey": "mewmew"
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "AutoClaw",
+      "options": {
+        "baseURL": "http://localhost:18791/v1",
+        "apiKey": "mewmew"
+      },
+      "models": {
+        "zai_auto": {
+          "name": "AutoClaw Auto"
+        },
+        "zai_glm-5-turbo": {
+          "name": "AutoClaw GLM-5 Turbo"
+        },
+        "openrouter_glm-5.2": {
+          "name": "AutoClaw GLM-5.2"
+        }
+      }
     }
   }
 }
