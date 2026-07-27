@@ -31,6 +31,7 @@ import crypto from "crypto";
 const PORT      = parseInt(process.env.PORT      || "18792", 10);
 const PROXY_KEY = process.env.PROXY_KEY           || "mewmew";
 const LOG_LEVEL = process.env.LOG_LEVEL           || "info";
+const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(50 * 1024 * 1024), 10);
 
 const UPSTREAM_BASE = "https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw";
 const TOKEN_FILE    = path.join(os.homedir(), ".openclaw-autoclaw", "request-headers.json");
@@ -592,11 +593,30 @@ function isAuthorized(req) {
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
+    const ct = req.headers["content-type"] || "";
+    if (!ct.includes("application/json")) {
+      return reject(Object.assign(new Error("Content-Type must be application/json"), { statusCode: 415 }));
+    }
+
+    let totalBytes = 0;
     const chunks = [];
-    req.on("data",  (c) => chunks.push(c));
-    req.on("end",   () => {
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString() || "{}")); }
-      catch (e) { reject(e); }
+    req.on("data", (c) => {
+      totalBytes += c.length;
+      if (totalBytes > MAX_BODY_BYTES) {
+        req.destroy(new Error("Request body too large"));
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      try {
+        let raw = Buffer.concat(chunks).toString("utf8");
+        // Strip UTF-8 BOM if present
+        if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+        resolve(JSON.parse(raw || "{}"));
+      } catch (e) {
+        reject(Object.assign(new Error(`Invalid JSON: ${e.message}`), { statusCode: 400 }));
+      }
     });
     req.on("error", reject);
   });
@@ -632,7 +652,22 @@ function handleModels(res) {
 }
 
 async function handleMessages(req, res) {
-  const body       = await readBody(req);
+  let body;
+  try {
+    body = await readBody(req);
+  } catch (err) {
+    const status = err.statusCode || 400;
+    return sendError(res, err.message, "invalid_request", status);
+  }
+
+  // Input validation
+  if (!body.model || typeof body.model !== "string") {
+    return sendError(res, "model must be a non-empty string", "invalid_request", 400);
+  }
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return sendError(res, "messages must be a non-empty array", "invalid_request", 400);
+  }
+
   const modelId    = resolveModel(body.model);
   const stream     = body.stream === true;
   const openAIBody = anthropicToOpenAI(body, modelId);
@@ -749,6 +784,7 @@ async function handleMessages(req, res) {
 
 const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin",  "*");
+  res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, Anthropic-Version, Anthropic-Beta");
 
@@ -775,19 +811,20 @@ const server = http.createServer(async (req, res) => {
 process.on("uncaughtException",  (e) => log.error("Uncaught exception:",  e));
 process.on("unhandledRejection", (e) => log.error("Unhandled rejection:", e));
 
-server.listen(PORT, () => {
+const HOST = process.env.HOST || "127.0.0.1";
+server.listen(PORT, HOST, () => {
   console.log(`
-  🛸  AutoClaw Proxy - Anthropic format  v1.0.0
-  ──────────────────────────────────────────────
-  Port     : ${PORT}
-  Upstream : ${UPSTREAM_BASE}
-  Token    : ${TOKEN_FILE}
-  Auth key : ${PROXY_KEY}
-  Models   : ${MODELS.map((m) => m.id).join(", ")}
-  ──────────────────────────────────────────────
-  Claude Code CLI (~/.claude/settings.json):
-    ANTHROPIC_BASE_URL   -> http://localhost:${PORT}
-    ANTHROPIC_AUTH_TOKEN -> ${PROXY_KEY}
+  ┌──────────────────────────────────────────────────────────┐
+  │  🛸  AUTOCLAW GATEWAY PROXY (Anthropic Format v1.0.0)   │
+  ├──────────────────────────────────────────────────────────┤
+  │  Host     : ${HOST.padEnd(42)} │
+  │  Port     : ${String(PORT).padEnd(42)} │
+  │  Auth Key : ${PROXY_KEY.padEnd(42)} │
+  │  Models   : ${MODELS.map(m => m.id).join(", ").padEnd(42)} │
+  ├──────────────────────────────────────────────────────────┤
+  │  Claude Code CLI Base URL:                              │
+  │    http://${HOST}:${PORT}                                      │
+  └──────────────────────────────────────────────────────────┘
   `);
 
   try {
