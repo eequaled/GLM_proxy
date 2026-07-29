@@ -28,10 +28,10 @@ import crypto from "crypto";
 // Config
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PORT      = parseInt(process.env.PORT      || "18792", 10);
+const PORT      = parseInt(process.env.PORT      || "18792", 10) || 18792;
 const PROXY_KEY = process.env.PROXY_KEY           || "mewmew";
 const LOG_LEVEL = process.env.LOG_LEVEL           || "info";
-const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(50 * 1024 * 1024), 10);
+const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(50 * 1024 * 1024), 10) || 50 * 1024 * 1024;
 
 const UPSTREAM_BASE = "https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw";
 const TOKEN_FILE    = path.join(os.homedir(), ".openclaw-autoclaw", "request-headers.json");
