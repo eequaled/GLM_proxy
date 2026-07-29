@@ -594,21 +594,26 @@ function isAuthorized(req) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const ct = req.headers["content-type"] || "";
-    if (!ct.includes("application/json")) {
+    if (!ct.toLowerCase().includes("application/json")) {
       return reject(Object.assign(new Error("Content-Type must be application/json"), { statusCode: 415 }));
     }
 
     let totalBytes = 0;
+    let limitHit = false;
     const chunks = [];
     req.on("data", (c) => {
       totalBytes += c.length;
       if (totalBytes > MAX_BODY_BYTES) {
-        req.destroy(new Error("Request body too large"));
+        if (!limitHit) {
+          limitHit = true;
+          reject(Object.assign(new Error("Request body too large"), { statusCode: 413 }));
+        }
         return;
       }
       chunks.push(c);
     });
     req.on("end", () => {
+      if (limitHit) return;
       try {
         let raw = Buffer.concat(chunks).toString("utf8");
         // Strip UTF-8 BOM if present
