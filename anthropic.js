@@ -817,19 +817,36 @@ process.on("uncaughtException",  (e) => log.error("Uncaught exception:",  e));
 process.on("unhandledRejection", (e) => log.error("Unhandled rejection:", e));
 
 const HOST = process.env.HOST || "127.0.0.1";
+
+// ── dashboard helpers ─────────────────────────────────────────────
+const BOX_W = 56; // content width between the border pipes
+function boxRow(text) {
+  // account for wide (emoji/CJK) glyphs so the right border stays aligned
+  const wide = /[\u{1100}-\u{115F}\u{2E80}-\u{A4CF}\u{AC00}-\u{D7A3}\u{F900}-\u{FAFF}\u{FE30}-\u{FE4F}\u{FF00}-\u{FF60}\u{FFE0}-\u{FFE6}\u{1F300}-\u{1FAFF}]/u;
+  let out = "";
+  let w = 0;
+  for (const ch of text) {
+    const cw = wide.test(ch) ? 2 : 1;
+    if (w + cw > BOX_W) break; // truncate to keep the border aligned
+    out += ch;
+    w += cw;
+  }
+  return `  │ ${out}${" ".repeat(BOX_W - w)} │`;
+}
+
 server.listen(PORT, HOST, () => {
   console.log(`
-  ┌──────────────────────────────────────────────────────────┐
-  │  🛸  AUTOCLAW GATEWAY PROXY (Anthropic Format v1.0.0)   │
-  ├──────────────────────────────────────────────────────────┤
-  │  Host     : ${HOST.padEnd(42)} │
-  │  Port     : ${String(PORT).padEnd(42)} │
-  │  Auth Key : ${PROXY_KEY.padEnd(42)} │
-  │  Models   : ${MODELS.map(m => m.id).join(", ").padEnd(42)} │
-  ├──────────────────────────────────────────────────────────┤
-  │  Claude Code CLI Base URL:                              │
-  │    http://${HOST}:${PORT}                                      │
-  └──────────────────────────────────────────────────────────┘
+  ┌${"─".repeat(BOX_W + 2)}┐
+  ${boxRow("🛸  AUTOCLAW GATEWAY PROXY (Anthropic Format v1.0.0)")}
+  ├${"─".repeat(BOX_W + 2)}┤
+  ${boxRow(`Host     : ${HOST}`)}
+  ${boxRow(`Port     : ${PORT}`)}
+  ${boxRow(`Auth Key : ${PROXY_KEY}`)}
+  ${boxRow(`Models   : ${MODELS.map(m => m.id).join(", ")}`)}
+  ├${"─".repeat(BOX_W + 2)}┤
+  ${boxRow("Claude Code CLI Base URL:")}
+  ${boxRow(`http://${HOST}:${PORT}`)}
+  └${"─".repeat(BOX_W + 2)}┘
   `);
 
   try {
