@@ -8,6 +8,14 @@
     "autoclaw-gateway": "./bin/cli.js",
     "autoclaw-proxy": "./bin/cli.js"
   },
+  "files": [
+    "main.js",
+    "anthropic.js",
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node main.js",
     "anthropic": "node anthropic.js"
