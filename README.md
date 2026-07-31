@@ -114,7 +114,7 @@ Content-Type: application/json
 |----|------|---------|------------|-------|
 | `zai_auto` | Auto | 1M | 393K | Routes to optimal model (DeepSeek-V4, GLM-5.1, GLM-Air, …) |
 | `zai_glm-5-turbo` | GLM-5-Turbo | 200K | 131K | Zhipu AI GLM-5 Turbo |
-| `openrouter_glm-5.2` | GLM-5.2 | 1M | 307K | Latest GLM-5.2 via OpenRouter |
+| `zaicoding_glm-5.2` | GLM-5.2 | 1M | 307K | Latest GLM-5.2 coding model |
 
 All models include `reasoning_content` in responses when the upstream model reasons.
 
@@ -139,7 +139,7 @@ All models include `reasoning_content` in responses when the upstream model reas
         "zai_glm-5-turbo": {
           "name": "AutoClaw GLM-5 Turbo"
         },
-        "openrouter_glm-5.2": {
+        "zaicoding_glm-5.2": {
           "name": "AutoClaw GLM-5.2"
         }
       }
