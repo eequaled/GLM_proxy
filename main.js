@@ -523,6 +523,7 @@ async function handleChatCompletions(req, res) {
   } catch (err) {
     const status  = err.message.includes("Cannot read AutoClaw token") ? 503 : 502;
     const errType = status === 503 ? "service_unavailable" : "upstream_error";
+    logJsonl({ model: modelId, status, ip: clientIp(req), latencyMs: Date.now() - startTime, error: errType });
     return sendError(res, err.message, errType, status);
   }
 

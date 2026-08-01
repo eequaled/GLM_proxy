@@ -738,6 +738,7 @@ async function handleMessages(req, res) {
     }
   } catch (err) {
     const status = err.message.includes("Cannot read AutoClaw token") ? 503 : 502;
+    logJsonl({ model: modelId, status, ip: clientIp(req), latencyMs: Date.now() - startTime, error: "upstream_error" });
     return sendError(res, err.message, "api_error", status);
   }
 
