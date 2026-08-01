@@ -24,9 +24,7 @@ import path from "path";
 import os from "os";
 import crypto from "crypto";
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Config
-// ─────────────────────────────────────────────────────────────────────────────
 
 const PORT      = parseInt(process.env.PORT      || "18792", 10) || 18792;
 const PROXY_KEY = process.env.PROXY_KEY           || "mewmew";
@@ -45,9 +43,7 @@ const CLIENT_HEADERS = {
   "X-Lang":    "en",
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Model catalog — auto-healed from AutoClaw's runtime config
-// ─────────────────────────────────────────────────────────────────────────────
 
 const RUNTIME_FILE      = path.join(os.homedir(), ".openclaw-autoclaw", "openclaw.runtime.json");
 const RUNTIME_LAST_GOOD = path.join(os.homedir(), ".openclaw-autoclaw", "openclaw.runtime.json.last-good");
@@ -101,9 +97,7 @@ const CLASS_MAP = [
 
 const DEFAULT_MODEL = sonnetModel;
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Logger
-// ─────────────────────────────────────────────────────────────────────────────
 
 const COLORS = {
   RESET: '\x1b[0m',
@@ -133,9 +127,7 @@ const log = {
   success: (...a) => LOG_LEVEL !== "silent" && console.log(...formatLog('SUCCESS', COLORS.GREEN, ...a)),
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Request log file  (keeps last N requests on disk, not in terminal)
-// ─────────────────────────────────────────────────────────────────────────────
+// Request log file (last N requests on disk, not terminal)
 
 const ANTHROPIC_LOG_FILE = path.join(process.cwd(), "proxy_requests_anthropic.json");
 const MAX_LOG_ENTRIES     = 50;
@@ -150,9 +142,7 @@ function logRequest(entry) {
   } catch (_) { /* silently skip if disk write fails */ }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Token layer  (identical to main.js)
-// ─────────────────────────────────────────────────────────────────────────────
+// Token layer (identical to main.js)
 
 let _token = null, _tokenReadAt = 0;
 
@@ -181,9 +171,7 @@ function getToken() {
 
 function invalidateToken() { _token = null; _tokenReadAt = 0; }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Format conversion  (Anthropic <-> OpenAI)
-// ─────────────────────────────────────────────────────────────────────────────
+// Format conversion (Anthropic ↔ OpenAI)
 
 /**
  * Resolve any Anthropic model name to an AutoClaw model ID.
@@ -237,8 +225,7 @@ function anthropicToOpenAI(body, modelId) {
       else if (block.type === "thinking")    { /* skip */ }
     }
 
-    // tool_result blocks → individual "tool" role messages (must come AFTER the
-    // assistant message that contained the tool_use, which is already in `messages`)
+    // tool_result blocks → "tool" role, after the tool_use assistant message
     for (const tr of toolResults) {
       let resultText;
       if (typeof tr.content === "string") {
@@ -265,8 +252,7 @@ function anthropicToOpenAI(body, modelId) {
           function: { name: tu.name, arguments: JSON.stringify(tu.input) },
         })),
       };
-      // Only include content if there's actual text — omitting it entirely is
-      // safer than null/empty-string for picky upstreams
+      // Omit empty content — null strings upset picky upstreams
       if (textParts.length > 0) msgObj.content = textParts.join("\n");
       messages.push(msgObj);
     } else if (textParts.length > 0) {
@@ -289,7 +275,7 @@ function anthropicToOpenAI(body, modelId) {
     },
   }));
 
-  // Convert tool_choice (only send for explicit choices, let "auto" be the default)
+  // Send tool_choice only for explicit choices ("auto" is the default)
   let openAIToolChoice;
   if (body.tool_choice) {
     if (typeof body.tool_choice === "string") {
@@ -533,15 +519,12 @@ function fmt(event, data) {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Upstream layer
-// ─────────────────────────────────────────────────────────────────────────────
 
 function callUpstream(modelId, openAIBody) {
   return new Promise((resolve, reject) => {
     const token   = getToken();
-    // The backend ONLY accepts the original 'zai_' prefixed model string.
-    // Do NOT strip the 'zai_' prefix — causes 500 "parse response failed".
+    // Keep 'zai_' prefix — stripping it causes 500 "parse response failed"
     const upstreamModelId = modelId;
     const payload = JSON.stringify({ ...openAIBody, model: upstreamModelId });
     const options = {
@@ -568,9 +551,7 @@ function callUpstream(modelId, openAIBody) {
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // HTTP helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 function generateId() { return crypto.randomBytes(12).toString("hex"); }
 
@@ -627,9 +608,7 @@ function readBody(req) {
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Route handlers
-// ─────────────────────────────────────────────────────────────────────────────
 
 function handleHealth(res) {
   let tokenOk = true, tokenError = null;
@@ -783,9 +762,7 @@ async function handleMessages(req, res) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Server
-// ─────────────────────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin",  "*");
@@ -818,10 +795,10 @@ process.on("unhandledRejection", (e) => log.error("Unhandled rejection:", e));
 
 const HOST = process.env.HOST || "127.0.0.1";
 
-// ── dashboard helpers ─────────────────────────────────────────────
+// Dashboard helpers
 const BOX_W = 56; // content width between the border pipes
 function boxRow(text) {
-  // account for wide (emoji/CJK) glyphs so the right border stays aligned
+  // Count wide (emoji/CJK) glyphs as 2 columns
   const wide = /[\u{1100}-\u{115F}\u{2E80}-\u{A4CF}\u{AC00}-\u{D7A3}\u{F900}-\u{FAFF}\u{FE30}-\u{FE4F}\u{FF00}-\u{FF60}\u{FFE0}-\u{FFE6}\u{1F300}-\u{1FAFF}]/u;
   let out = "";
   let w = 0;

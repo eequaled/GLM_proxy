@@ -27,9 +27,7 @@ import path from "path";
 import os from "os";
 import crypto from "crypto";
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Config
-// ─────────────────────────────────────────────────────────────────────────────
 
 const PORT       = parseInt(process.env.PORT     || "18791", 10) || 18791;
 const PROXY_KEY  = process.env.PROXY_KEY          || "mewmew";
@@ -43,7 +41,7 @@ const UPSTREAM_URL  = `${UPSTREAM_BASE}/v1/chat/completions`;
 const TOKEN_FILE    = path.join(os.homedir(), ".openclaw-autoclaw", "request-headers.json");
 const TOKEN_TTL_MS  = 5 * 60 * 1000; // re-read file at most every 5 min
 
-// Headers AutoClaw always includes — identifies the request as coming from the desktop client
+// Identifies the request as coming from the AutoClaw desktop client
 const CLIENT_HEADERS = {
   "X-Tm":      "win",
   "X-Version": "1.10.3",
@@ -52,9 +50,7 @@ const CLIENT_HEADERS = {
   "X-Lang":    "en",
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Model catalog — auto-healed from AutoClaw's runtime config
-// ─────────────────────────────────────────────────────────────────────────────
 
 const RUNTIME_FILE      = path.join(os.homedir(), ".openclaw-autoclaw", "openclaw.runtime.json");
 const RUNTIME_LAST_GOOD = path.join(os.homedir(), ".openclaw-autoclaw", "openclaw.runtime.json.last-good");
@@ -96,9 +92,7 @@ function loadModelsFromRuntime() {
 const MODELS       = loadModelsFromRuntime();
 const KNOWN_IDS    = new Set(MODELS.map((m) => m.id));
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Logger
-// ─────────────────────────────────────────────────────────────────────────────
 
 const COLORS = {
   RESET: '\x1b[0m',
@@ -128,9 +122,7 @@ const log = {
   success: (...a) => LOG_LEVEL !== "silent" && console.log(...formatLog('SUCCESS', COLORS.GREEN, ...a)),
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Request log file  (keeps last N requests on disk, not in terminal)
-// ─────────────────────────────────────────────────────────────────────────────
+// Request log file (last N requests on disk, not terminal)
 
 const REQUEST_LOG_FILE = path.join(process.cwd(), "proxy_requests.json");
 const MAX_LOG_ENTRIES   = 50;
@@ -145,9 +137,7 @@ function logRequest(entry) {
   } catch (_) { /* silently skip if disk write fails */ }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Token layer  (mirrors acc's token-extractor.js)
-// ─────────────────────────────────────────────────────────────────────────────
+// Token layer (mirrors acc's token-extractor.js)
 
 let _token       = null;
 let _tokenReadAt = 0;
@@ -189,9 +179,7 @@ function invalidateToken() {
   _tokenReadAt = 0;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Upstream layer
-// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Open an HTTPS connection to AutoClaw's upstream and return the IncomingMessage.
@@ -200,15 +188,12 @@ function invalidateToken() {
 function callUpstream(modelId, requestBody) {
   return new Promise((resolve, reject) => {
     const token   = getToken();
-    // The backend ONLY accepts the original model string with prefix.
-    // Pass through known model IDs as-is. Map "auto" → "zai_auto".
-    // Everything else gets "zai_" prepended as a best-effort fallback.
+    // Keep 'zai_' prefix: pass known IDs as-is, map "auto", else prepend 'zai_'
     const upstreamModelId = KNOWN_IDS.has(modelId) ? modelId
       : modelId === "auto" ? "zai_auto"
       : `zai_${modelId}`;
 
-    // Normalize messages: some clients (like Trae) send `content` as an array of text objects,
-    // which AutoClaw/Zhipu's backend often rejects with "parse response failed" (500).
+    // Trae sends content as text-object arrays that Zhipu rejects (500) — flatten them
     const normalizedMessages = (requestBody.messages || []).map(msg => {
       const newMsg = { ...msg };
       
@@ -342,9 +327,7 @@ function bufferSSE(upstreamRes, modelId) {
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // HTTP helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 function generateId() {
   return crypto.randomBytes(12).toString("hex");
@@ -406,9 +389,7 @@ function readBody(req) {
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Route handlers
-// ─────────────────────────────────────────────────────────────────────────────
 
 function handleHealth(res) {
   let tokenOk = true, tokenError = null;
@@ -567,7 +548,7 @@ process.on("unhandledRejection", (e) => log.error("Unhandled rejection:",  e));
 
 const HOST = process.env.HOST || "127.0.0.1";
 
-// ── dashboard helpers ─────────────────────────────────────────────
+// Dashboard helpers
 const BOX_W = 56; // content width between the border pipes
 function boxRow(text) {
   // account for wide (emoji/CJK) glyphs so the right border stays aligned
