@@ -8,6 +8,7 @@
   <img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen" alt="Node.js >=18">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License MIT">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey" alt="Platform">
+  <img src="https://github.com/eequaled/GLM_proxy/actions/workflows/ci.yml/badge.svg" alt="CI">
 </p>
 
 ---
@@ -76,9 +77,9 @@ When you see the dashboard banner, you're good to go.
 Optional env vars / flags:
 
 ```bash
-autoclaw-gateway --port 3001 --key mykey
+autoclaw-gateway --port 3001 --key mykey --rate-limit 50
 # or
-PORT=3001 PROXY_KEY=mykey node main.js
+PORT=3001 PROXY_KEY=mykey RATE_LIMIT=50 node main.js
 ```
 
 | Variable/Flag | Default   | Description                         |
@@ -87,6 +88,18 @@ PORT=3001 PROXY_KEY=mykey node main.js
 | `HOST`        | `127.0.0.1` | Bind address                     |
 | `PROXY_KEY`   | `mewmew`  | API key clients must send           |
 | `LOG_LEVEL`   | `info`    | `debug` / `info` / `silent`         |
+| `MAX_BODY_BYTES` | `52428800` | Max request body (50 MB)         |
+| `RATE_LIMIT`  | `30`      | Max requests per second per client IP |
+| `JSONL_LOG`   | (off)     | Write structured JSONL request log when `true` |
+| `JSONL_FILE`  | `proxy_requests.jsonl` | JSONL output path |
+| `JSONL_MAX_BYTES` | `10485760` | Rotate JSONL log when it exceeds this (10 MB) |
+
+### JSONL Request Logging
+
+Set `JSONL_LOG=true` (or `LOG_LEVEL=debug`) to write one JSON line per request:
+```json
+{"ts":"2026-07-29T03:41:00.000Z","model":"zai_auto","status":200,"ip":"127.0.0.1","latencyMs":423}
+```
 
 ## API
 
@@ -238,7 +251,21 @@ Any tool that supports OpenAI-compatible providers works. Point it at `http://lo
 - Only one AutoClaw account can be active at a time — multi-account pooling isn't supported
 - The proxy key (`PROXY_KEY`) is just a local password for this proxy, not your AutoClaw credentials — set it to whatever you want
 - If a request fails with 401, the proxy automatically refreshes its auth and you can retry immediately
+- If a request fails with 400, the proxy retries once after a 2s delay before surfacing the error
+- Token file is watched for changes — AutoClaw can rotate auth mid-session without a restart
+- Rate limit is enforced per client IP (default 30 req/s, configurable via `RATE_LIMIT` or `--rate-limit`)
 - No dependencies beyond Node.js built-in modules — zero `node_modules`, zero install step
+
+## Publishing to npm
+
+Set up a GitHub secret `NPM_TOKEN` with your npm access token, then:
+
+```bash
+git tag v1.0.1
+git push --tags
+```
+
+The release workflow in `.github/workflows/release.yml` runs tests and publishes automatically.
 
 ## Special Thanks
 
