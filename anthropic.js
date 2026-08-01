@@ -30,6 +30,11 @@ const PORT      = parseInt(process.env.PORT      || "18792", 10) || 18792;
 const PROXY_KEY = process.env.PROXY_KEY           || "mewmew";
 const LOG_LEVEL = process.env.LOG_LEVEL           || "info";
 const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(50 * 1024 * 1024), 10) || 50 * 1024 * 1024;
+const RATE_LIMIT = parseInt(process.env.RATE_LIMIT || "30", 10) || 30; // req/s per IP
+
+const JSONL_LOG  = process.env.JSONL_LOG === "true" || process.env.LOG_LEVEL === "debug";
+const JSONL_FILE = process.env.JSONL_FILE || path.join(process.cwd(), "proxy_requests_anthropic.jsonl");
+const JSONL_MAX_BYTES = parseInt(process.env.JSONL_MAX_BYTES || String(10 * 1024 * 1024), 10) || 10 * 1024 * 1024;
 
 const UPSTREAM_BASE = "https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw";
 const TOKEN_FILE    = path.join(os.homedir(), ".openclaw-autoclaw", "request-headers.json");
@@ -170,6 +175,16 @@ function getToken() {
 }
 
 function invalidateToken() { _token = null; _tokenReadAt = 0; }
+
+// Hot-reload token when AutoClaw rotates it — avoids restart
+fs.watchFile(TOKEN_FILE, { interval: 1000 }, () => {
+  try {
+    _token = loadToken();
+    log.info("Token reloaded");
+  } catch (e) {
+    log.warn(`Token reload failed: ${e.message}`);
+  }
+});
 
 // Format conversion (Anthropic ↔ OpenAI)
 
@@ -608,6 +623,55 @@ function readBody(req) {
   });
 }
 
+// Rate limiter — simple token bucket per client IP
+const _buckets = new Map();
+function rateLimit(ip) {
+  const now = Date.now();
+  const b = _buckets.get(ip);
+  if (!b) { _buckets.set(ip, { tokens: RATE_LIMIT, last: now }); return true; }
+  const elapsed = (now - b.last) / 1000;
+  b.tokens = Math.min(RATE_LIMIT, b.tokens + elapsed * RATE_LIMIT);
+  b.last = now;
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+// Drop stale buckets so the map can't grow unbounded (unref'd — doesn't hold the process open)
+setInterval(() => {
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  for (const [ip, b] of _buckets) if (b.last < cutoff) _buckets.delete(ip);
+}, 3600 * 1000).unref();
+
+// Resolve the client IP for rate limiting — only trust X-Forwarded-For from non-local peers
+function clientIp(req) {
+  const peer = req.socket.remoteAddress || "unknown";
+  const loopback = peer === "::1" || peer.startsWith("127.") || peer.startsWith("::ffff:127.");
+  if (!loopback) {
+    const xff = req.headers["x-forwarded-for"];
+    if (xff) return xff.split(",")[0].trim();
+  }
+  return peer.replace(/^::ffff:/, "");
+}
+
+// Collect a full upstream response body (error inspection / passthrough)
+function collectResponse(res) {
+  return new Promise((resolve) => {
+    let raw = "";
+    res.on("data", (c) => (raw += c));
+    res.on("end", () => resolve(raw));
+    res.on("error", () => resolve(""));
+  });
+}
+
+// JSONL structured log — one line per request, rotated past the cap so disk can't fill
+function logJsonl(entry) {
+  if (!JSONL_LOG) return;
+  try {
+    if (fs.statSync(JSONL_FILE).size > JSONL_MAX_BYTES) fs.renameSync(JSONL_FILE, `${JSONL_FILE}.1`);
+  } catch (_) {}
+  fs.appendFile(JSONL_FILE, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n", () => {});
+}
+
 // Route handlers
 
 function handleHealth(res) {
@@ -636,6 +700,7 @@ function handleModels(res) {
 }
 
 async function handleMessages(req, res) {
+  const startTime = Date.now();
   let body;
   try {
     body = await readBody(req);
@@ -645,8 +710,8 @@ async function handleMessages(req, res) {
   }
 
   // Input validation
-  if (!body.model || typeof body.model !== "string") {
-    return sendError(res, "model must be a non-empty string", "invalid_request", 400);
+  if (!body.model || typeof body.model !== "string" || body.model.length > 256) {
+    return sendError(res, "model must be a non-empty string (max 256 chars)", "invalid_request", 400);
   }
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return sendError(res, "messages must be a non-empty array", "invalid_request", 400);
@@ -659,8 +724,18 @@ async function handleMessages(req, res) {
   log.info(`messages model=${body.model} -> ${modelId} stream=${stream}`);
 
   let upstreamRes;
+  let upstreamErrBody = "";
   try {
+    // 400 "invalid request" is AutoClaw's known transient hiccup — retry it once
     upstreamRes = await callUpstream(modelId, openAIBody);
+    if (upstreamRes.statusCode === 400) {
+      upstreamErrBody = await collectResponse(upstreamRes);
+      if (upstreamErrBody.includes('"invalid request"')) {
+        log.info("Upstream 400 invalid request — retrying once");
+        await new Promise(r => setTimeout(r, 2000));
+        upstreamRes = await callUpstream(modelId, openAIBody);
+      }
+    }
   } catch (err) {
     const status = err.message.includes("Cannot read AutoClaw token") ? 503 : 502;
     return sendError(res, err.message, "api_error", status);
@@ -681,24 +756,23 @@ async function handleMessages(req, res) {
     message_count: openAIBody.messages?.length || 0,
   });
 
+  logJsonl({ model: modelId, status: upstreamRes.statusCode, ip: clientIp(req), latencyMs: Date.now() - startTime });
+
   if (upstreamRes.statusCode === 401) {
     invalidateToken();
     return sendError(res, "AutoClaw token expired - invalidated cache, retry the request", "authentication_error", 401);
   }
 
   if (upstreamRes.statusCode >= 400) {
-    let errBody = "";
-    upstreamRes.on("data", (c) => (errBody += c));
-    upstreamRes.on("end",  () => {
-      try {
-        const parsed = JSON.parse(errBody);
-        log.error(`Upstream error ${upstreamRes.statusCode}:`, parsed.error?.message || errBody);
-        sendJSON(res, parsed, upstreamRes.statusCode);
-      } catch {
-        log.error(`Upstream error ${upstreamRes.statusCode}:`, errBody);
-        sendError(res, errBody || "Upstream error", "api_error", upstreamRes.statusCode);
-      }
-    });
+    const errBody = upstreamErrBody || await collectResponse(upstreamRes);
+    try {
+      const parsed = JSON.parse(errBody);
+      log.error(`Upstream error ${upstreamRes.statusCode}:`, parsed.error?.message || errBody);
+      sendJSON(res, parsed, upstreamRes.statusCode);
+    } catch {
+      log.error(`Upstream error ${upstreamRes.statusCode}:`, errBody);
+      sendError(res, errBody || "Upstream error", "api_error", upstreamRes.statusCode);
+    }
     return;
   }
 
@@ -772,6 +846,13 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
+  // Rate limit before auth so brute-force attempts can't bypass the throttle
+  if (!rateLimit(clientIp(req))) {
+    res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "1" });
+    res.end(JSON.stringify({ error: { message: "Rate limit exceeded", type: "rate_limit_error" } }));
+    return;
+  }
+
   if (!isAuthorized(req)) {
     return sendError(res, "Invalid or missing API key", "authentication_error", 401);
   }
@@ -819,6 +900,7 @@ server.listen(PORT, HOST, () => {
   ${boxRow(`Host     : ${HOST}`)}
   ${boxRow(`Port     : ${PORT}`)}
   ${boxRow(`Auth Key : ${PROXY_KEY}`)}
+  ${boxRow(`Rate Lim : ${RATE_LIMIT} req/s per IP`)}
   ${boxRow(`Models   : ${MODELS.map(m => m.id).join(", ")}`)}
   ├${"─".repeat(BOX_W + 2)}┤
   ${boxRow("Claude Code CLI Base URL:")}

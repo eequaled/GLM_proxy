@@ -14,6 +14,8 @@ jobs:
       - run: node --check main.js
       - run: node --check anthropic.js
       - run: npm test
+        env:
+          RATE_LIMIT: "200"
       - run: npm publish
         if: ${{ secrets.NPM_TOKEN != '' }}
         env:
