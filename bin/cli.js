@@ -20,6 +20,7 @@ function showHelp() {
     --port <number>   Port to listen on (default: 18791 for OpenAI, 18792 for Anthropic)
     --host <ip>       Host to bind (default: 127.0.0.1)
     --key <string>    Authentication key for clients (default: mewmew)
+    --rate-limit <n>  Max requests per second per IP (default: 30)
     --help, -h        Show this help message
   `);
   process.exit(0);
@@ -34,6 +35,8 @@ const portIdx = args.indexOf("--port");
 const keyIdx = args.indexOf("--key");
 const hostIdx = args.indexOf("--host");
 
+const rateLimitIdx = args.indexOf("--rate-limit");
+
 if (portIdx !== -1 && args[portIdx + 1]) {
   process.env.PORT = args[portIdx + 1];
 }
@@ -42,6 +45,9 @@ if (keyIdx !== -1 && args[keyIdx + 1]) {
 }
 if (hostIdx !== -1 && args[hostIdx + 1]) {
   process.env.HOST = args[hostIdx + 1];
+}
+if (rateLimitIdx !== -1 && args[rateLimitIdx + 1]) {
+  process.env.RATE_LIMIT = args[rateLimitIdx + 1];
 }
 
 const targetFile = isAnthropic
