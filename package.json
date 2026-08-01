@@ -18,7 +18,8 @@
   },
   "scripts": {
     "start": "node main.js",
-    "anthropic": "node anthropic.js"
+    "anthropic": "node anthropic.js",
+    "test": "node tests/pen-test-p1.mjs && node tests/pen-test-p2.mjs && node tests/pen-test-p3.mjs && node tests/pen-test-p4.mjs && node tests/pen-test-p5.mjs"
   },
   "keywords": [
     "autoclaw",
