@@ -57,27 +57,36 @@ AutoClaw handles authentication automatically. As long as AutoClaw is running an
 
 ## Quick Start
 
-```bash
-# OpenAI format (OpenCode, Cursor, etc.)
-node main.js
+> **Coming soon to npm.** For now, run directly:
+>
+> ```bash
+> node main.js                  # OpenAI format (port 18791)
+> node anthropic.js             # Anthropic format (port 18792)
+> ```
+>
+> Once published:
+> ```bash
+> npx autoclaw-gateway
+> npm install -g autoclaw-gateway
+> autoclaw-gateway --anthropic  # or just autoclaw-gateway
+> ```
 
-# Anthropic format (Claude Code CLI)
-node anthropic.js
+When you see the dashboard banner, you're good to go.
+
+Optional env vars / flags:
+
+```bash
+autoclaw-gateway --port 3001 --key mykey
+# or
+PORT=3001 PROXY_KEY=mykey node main.js
 ```
 
-When you see `[info] Token loaded` followed by `✅ Token loaded — ready`, you're good to go.
-
-Optional env vars (work for both files):
-
-```bash
-PORT=3001 PROXY_KEY=mykey LOG_LEVEL=debug node main.js
-```
-
-| Variable    | Default  | Description                         |
-|-------------|----------|-------------------------------------|
-| `PORT`      | `18791`  | Port this proxy listens on          |
-| `PROXY_KEY` | `mewmew` | API key clients must send           |
-| `LOG_LEVEL` | `info`   | `debug` / `info` / `silent`         |
+| Variable/Flag | Default   | Description                         |
+|---------------|-----------|-------------------------------------|
+| `PORT`        | `18791`   | Port this proxy listens on          |
+| `HOST`        | `127.0.0.1` | Bind address                     |
+| `PROXY_KEY`   | `mewmew`  | API key clients must send           |
+| `LOG_LEVEL`   | `info`    | `debug` / `info` / `silent`         |
 
 ## API
 
@@ -171,7 +180,7 @@ Claude model names are automatically mapped to the best available AutoClaw model
 
 | Claude model | Routes to |
 |---|---|
-| `claude-opus-*` | `openrouter_glm-5.2` |
+| `claude-opus-*` | `zaicoding_glm-5.2` |
 | `claude-sonnet-*` | `zai_auto` |
 | `claude-haiku-*` | `zai_glm-5-turbo` |
 
