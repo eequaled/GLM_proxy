@@ -11,14 +11,14 @@
   <img src="https://github.com/eequaled/GLM_proxy/actions/workflows/ci.yml/badge.svg" alt="CI">
 </p>
 
-> **v2.0.0** — interactive arrow-key CLI, shared core in `lib/`, zero dependencies.
+> **v2.0.0** — one interactive CLI, shared core in `lib/`, zero dependencies.
 
 ---
 
-One entry point now: `node bin/cli.js` (or `npm start`). It asks which format you want, or you can skip the menu with a flag:
+Two API formats, one launcher. `node bin/cli.js` asks which one you want with an arrow-key menu and starts the right proxy. Flags skip the menu.
 
-| Format | Flag | Port | Use with |
-|--------|------|------|----------|
+| Format | Flag | Default port | Use with |
+|--------|------|--------------|----------|
 | OpenAI (`/v1/chat/completions`) | `--openai` (default) | `18791` | OpenCode, Cursor, Continue, LiteLLM, Python/JS SDKs |
 | Anthropic (`/v1/messages`) | `--anthropic` | `18792` | Claude Code CLI, Anthropic SDK |
 
@@ -36,19 +36,20 @@ Make sure **AutoClaw is running and you're logged in**. The proxy reads auth fro
 
 ### 2. Proxy in action — it works
 
-Start the proxy and watch it handle requests from your tool of choice:
+Start the proxy and watch it handle requests from your tool of choice.
 
 <p align="center">
-  <i>Screenshot: Terminal showing <code>node bin/cli.js</code> startup with the format menu, then requests being proxied through</i>
+  <i>ignore claude code here</i>
   <br>
-  <img src="./screenshots/proxy-working.png" alt="Proxy terminal showing successful operation" width="700">
+  <img src="./screenshots/image.png" alt="Proxy terminal showing successful operation" width="700">
 </p>
 
 ## How it works
 
 ```
-Your App           AutoClaw Proxy          AutoClaw Backend
-(OpenAI SDK)  ───▶  localhost:18791   ───▶  autoglm-api.autoglm.ai
+Your App           AutoClaw Proxy CLI         AutoClaw Backend
+(OpenAI SDK)  ───▶  localhost:18791 (menu)  ───▶  autoglm-api.autoglm.ai
+                    localhost:18792 (menu)
 ```
 
 AutoClaw handles authentication automatically. As long as AutoClaw is running and you're logged in, the proxy will work — no manual token setup needed.
@@ -60,10 +61,9 @@ AutoClaw handles authentication automatically. As long as AutoClaw is running an
 
 ## Quick Start
 
-**v2.0.0**: the CLI is the entry point now. No install step, no `node_modules` — just run it:
-
 ```bash
-npm start                  # or: node bin/cli.js
+npm start
+# or: node bin/cli.js
 ```
 
 You get an interactive menu: arrow keys to move, Enter to pick. Choose the format, port, host, and auth key, and the proxy starts. Ctrl+C quits cleanly and restores your terminal.
@@ -74,40 +74,59 @@ Skip the menu with flags:
 node bin/cli.js --anthropic --port 3001 --key mykey
 ```
 
-or feed config through env — the CLI leaves existing env vars alone:
+Or feed config through env vars — the CLI leaves existing env vars alone:
 
 ```bash
-PORT=3001 PROXY_KEY=mykey RATE_LIMIT=50 node main.js
+PORT=3001 PROXY_KEY=mykey RATE_LIMIT=50 node bin/cli.js
 ```
 
-When you see the dashboard banner, you're good to go. Without a TTY (piped stdin, CI) the CLI skips the menu and starts the OpenAI format with your env vars or defaults.
+Without a TTY (piped stdin, CI), the CLI skips the menu and starts the OpenAI format on port 18791 using your env vars or the defaults.
 
-Optional env vars / flags:
+### npm commands
+
+| Command | What it does |
+|---------|--------------|
+| `npm start` | Launch the interactive CLI (`node bin/cli.js`) |
+| `npm run anthropic` | Start the Anthropic proxy directly (`node anthropic.js`), bypassing the menu |
+| `npm test` | Run the pen-test suite (`tests/pen-test-p1` through `p5`) |
+
+### Direct entry points (optional)
+
+You can still run either proxy directly without the CLI:
 
 ```bash
-autoclaw-gateway --port 3001 --key mykey --rate-limit 50
-# or
-PORT=3001 PROXY_KEY=mykey RATE_LIMIT=50 node main.js
+node main.js        # OpenAI format, port 18791
+node anthropic.js   # Anthropic format, port 18792
 ```
 
-| Variable/Flag | Default   | Description                         |
-|---------------|-----------|-------------------------------------|
-| `PORT`        | `18791`   | Port this proxy listens on          |
-| `HOST`        | `127.0.0.1` | Bind address                     |
-| `PROXY_KEY`   | `mewmew`  | API key clients must send           |
-| `LOG_LEVEL`   | `info`    | `debug` / `info` / `silent`         |
-| `MAX_BODY_BYTES` | `52428800` | Max request body (50 MB)         |
-| `RATE_LIMIT`  | `30`      | Max requests per second per client IP |
-| `JSONL_LOG`   | (off)     | Write structured JSONL request log when `true` |
-| `JSONL_FILE`  | `proxy_requests.jsonl` | JSONL output path |
+They read the same env vars and respect `HOST`, `PORT`, `PROXY_KEY`, `RATE_LIMIT`, etc.
+
+### Options
+
+| Variable / Flag | Default | Description |
+|-----------------|---------|-------------|
+| `PORT` / `--port` | `18791` (OpenAI), `18792` (Anthropic) | Port this proxy listens on |
+| `HOST` / `--host` | `127.0.0.1` | Bind address |
+| `PROXY_KEY` / `--key` | `mewmew` | API key clients must send |
+| `RATE_LIMIT` / `--rate-limit` | `30` | Max requests per second per client IP |
+| `LOG_LEVEL` | `info` | `debug` / `info` / `silent` |
+| `MAX_BODY_BYTES` | `52428800` | Max request body (50 MB) |
+| `JSONL_LOG` | off | Write structured JSONL request log when `true` |
+| `JSONL_FILE` | `proxy_requests.jsonl` (Anthropic: `proxy_requests_anthropic.jsonl`) | JSONL output path |
 | `JSONL_MAX_BYTES` | `10485760` | Rotate JSONL log when it exceeds this (10 MB) |
+| `--anthropic` | — | Run in Anthropic API format |
+| `--openai` | — | Run in OpenAI API format (default) |
+| `--help`, `-h` | — | Show CLI help |
 
 ### JSONL Request Logging
 
 Set `JSONL_LOG=true` (or `LOG_LEVEL=debug`) to write one JSON line per request:
+
 ```json
 {"ts":"2026-07-29T03:41:00.000Z","model":"zai_auto","status":200,"ip":"127.0.0.1","latencyMs":423}
 ```
+
+The Anthropic variant writes to `proxy_requests_anthropic.jsonl`.
 
 ## API
 
@@ -126,9 +145,9 @@ Returns token status and upstream info.
 
 ### `GET /v1/models`
 
-Lists available models in OpenAI format.
+Lists available models in OpenAI format (OpenAI proxy) or Anthropic format (Anthropic proxy).
 
-### `POST /v1/chat/completions`
+### `POST /v1/chat/completions` — OpenAI proxy
 
 OpenAI-compatible chat completions. Supports both streaming (`stream: true`) and non-streaming.
 
@@ -138,6 +157,16 @@ Authorization: Bearer mewmew
 Content-Type: application/json
 ```
 
+### `POST /v1/messages` — Anthropic proxy
+
+Anthropic-compatible Messages API. Supports both streaming and non-streaming. Claude model names are automatically mapped to the best available AutoClaw model:
+
+| Claude model | Routes to |
+|---|---|
+| `claude-opus-*` | `zaicoding_glm-5.2` |
+| `claude-sonnet-*` | `zai_auto` |
+| `claude-haiku-*` | `zai_glm-5-turbo` |
+
 ## Models
 
 | ID | Name | Context | Max Output | Notes |
@@ -146,7 +175,7 @@ Content-Type: application/json
 | `zai_glm-5-turbo` | GLM-5-Turbo | 200K | 131K | Zhipu AI GLM-5 Turbo |
 | `zaicoding_glm-5.2` | GLM-5.2 | 1M | 307K | Latest GLM-5.2 coding model |
 
-All models include `reasoning_content` in responses when the upstream model reasons.
+All models include `reasoning_content` in responses when the upstream model reasons. The model list is loaded from AutoClaw's `openclaw.runtime.json` at startup, with a built-in fallback if that file isn't readable.
 
 ## Integrations
 
@@ -163,15 +192,9 @@ All models include `reasoning_content` in responses when the upstream model reas
         "apiKey": "mewmew"
       },
       "models": {
-        "zai_auto": {
-          "name": "AutoClaw Auto"
-        },
-        "zai_glm-5-turbo": {
-          "name": "AutoClaw GLM-5 Turbo"
-        },
-        "zaicoding_glm-5.2": {
-          "name": "AutoClaw GLM-5.2"
-        }
+        "zai_auto": { "name": "AutoClaw Auto" },
+        "zai_glm-5-turbo": { "name": "AutoClaw GLM-5 Turbo" },
+        "zaicoding_glm-5.2": { "name": "AutoClaw GLM-5.2" }
       }
     }
   }
@@ -196,14 +219,6 @@ Add to `~/.claude/settings.json`:
   }
 }
 ```
-
-Claude model names are automatically mapped to the best available AutoClaw model:
-
-| Claude model | Routes to |
-|---|---|
-| `claude-opus-*` | `zaicoding_glm-5.2` |
-| `claude-sonnet-*` | `zai_auto` |
-| `claude-haiku-*` | `zai_glm-5-turbo` |
 
 ### Python
 
@@ -257,23 +272,12 @@ Any tool that supports OpenAI-compatible providers works. Point it at `http://lo
 ## Notes
 
 - Only one AutoClaw account can be active at a time — multi-account pooling isn't supported
-- The proxy key (`PROXY_KEY`) is just a local password for this proxy, not your AutoClaw credentials — set it to whatever you want
-- If a request fails with 401, the proxy automatically refreshes its auth and you can retry immediately
-- If a request fails with 400, the proxy retries once after a 2s delay before surfacing the error
-- Token file is watched for changes — AutoClaw can rotate auth mid-session without a restart
-- Rate limit is enforced per client IP (default 30 req/s, configurable via `RATE_LIMIT` or `--rate-limit`)
-- No dependencies at all: the interactive menu is hand-rolled on Node's built-in `readline`, so there's still zero `node_modules` and zero install step
-
-## Publishing to npm
-
-Set up a GitHub secret `NPM_TOKEN` with your npm access token, then:
-
-```bash
-git tag v2.0.0
-git push --tags
-```
-
-The release workflow in `.github/workflows/release.yml` runs tests and publishes automatically.
+- `PROXY_KEY` is just a local password for this proxy, not your AutoClaw credentials — set it to whatever you want
+- On a 401, the proxy invalidates its cached token and you can retry immediately
+- On a 400 "invalid request" from upstream, the proxy retries once after a 2s delay before surfacing the error
+- The token file is watched for changes — AutoClaw can rotate auth mid-session without a restart
+- Rate limit is enforced per client IP (default 30 req/s)
+- No dependencies at all: the interactive menu is hand-rolled on Node's built-in `readline`, so there's zero `node_modules` and zero install step
 
 ## Special Thanks
 
