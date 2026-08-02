@@ -1,6 +1,6 @@
 {
   "name": "autoclaw-gateway",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "OpenAI & Anthropic compatible proxy for AutoClaw's Zhipu AI backend",
   "main": "main.js",
   "type": "module",
@@ -11,13 +11,14 @@
   "files": [
     "main.js",
     "anthropic.js",
-    "bin/"
+    "bin/",
+    "lib/"
   ],
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "start": "node main.js",
+    "start": "node bin/cli.js",
     "anthropic": "node anthropic.js",
     "test": "node tests/pen-test-p1.mjs && node tests/pen-test-p2.mjs && node tests/pen-test-p3.mjs && node tests/pen-test-p4.mjs && node tests/pen-test-p5.mjs"
   },
