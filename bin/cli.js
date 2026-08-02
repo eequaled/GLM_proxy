@@ -2,6 +2,7 @@
 
 import path from "path";
 import { fileURLToPath, pathToFileURL } from "url";
+import { promptSelect, promptInput, promptNumber } from "../lib/prompts.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -55,37 +56,26 @@ if (rateLimitIdx !== -1 && args[rateLimitIdx + 1]) {
 
 const hasFlags = FLAGS.some((f) => args.includes(f));
 
-// Menu
+// Menu (only on a real TTY with no flags)
 if (!hasFlags && process.stdin.isTTY) {
-  try {
-    const { select, number, input } = await import("@inquirer/prompts");
+  const format = await promptSelect({
+    message: "API format:",
+    choices: [
+      { name: "OpenAI", value: "openai" },
+      { name: "Anthropic", value: "anthropic" },
+    ],
+    default: "openai",
+  });
+  isAnthropic = format === "anthropic";
 
-    const format = await select({
-      message: "API format:",
-      choices: [
-        { name: "OpenAI", value: "openai" },
-        { name: "Anthropic", value: "anthropic" },
-      ],
-      default: "openai",
-    });
-    isAnthropic = format === "anthropic";
+  const defaultPort = format === "anthropic" ? 18792 : 18791;
+  const port = await promptNumber({ message: "Port:", default: defaultPort });
+  const host = await promptInput({ message: "Host:", default: "127.0.0.1" });
+  const key = await promptInput({ message: "Auth key:", default: "mewmew" });
 
-    const defaultPort = format === "anthropic" ? 18792 : 18791;
-    const port = await number({ message: "Port:", default: defaultPort });
-    const host = await input({ message: "Host:", default: "127.0.0.1" });
-    const key = await input({ message: "Auth key:", default: "mewmew" });
-
-    process.env.PORT = String(port);
-    process.env.HOST = host;
-    process.env.PROXY_KEY = key;
-  } catch (err) {
-    // Ctrl+C aborts the prompt → exit cleanly
-    if (err?.name === "ExitPromptError" || err?.name === "CancelPromptError") {
-      console.log();
-      process.exit(0);
-    }
-    throw err;
-  }
+  process.env.PORT = String(port);
+  process.env.HOST = host;
+  process.env.PROXY_KEY = key;
 } else if (!hasFlags) {
   // Piped stdin / CI → OpenAI defaults, no menu
   process.env.PORT = "18791";

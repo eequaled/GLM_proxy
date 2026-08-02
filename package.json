@@ -17,9 +17,6 @@
   "engines": {
     "node": ">=18"
   },
-  "dependencies": {
-    "@inquirer/prompts": "^7.0.0"
-  },
   "scripts": {
     "start": "node main.js",
     "anthropic": "node anthropic.js",
