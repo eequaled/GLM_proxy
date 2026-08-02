@@ -76,11 +76,6 @@ if (!hasFlags && process.stdin.isTTY) {
   process.env.PORT = String(port);
   process.env.HOST = host;
   process.env.PROXY_KEY = key;
-} else if (!hasFlags) {
-  // Piped stdin / CI → OpenAI defaults, no menu
-  process.env.PORT = "18791";
-  process.env.HOST = "127.0.0.1";
-  process.env.PROXY_KEY = "mewmew";
 }
 
 const targetFile = isAnthropic
