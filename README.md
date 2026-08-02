@@ -11,14 +11,16 @@
   <img src="https://github.com/eequaled/GLM_proxy/actions/workflows/ci.yml/badge.svg" alt="CI">
 </p>
 
+> **v2.0.0** — interactive arrow-key CLI, shared core in `lib/`, zero dependencies.
+
 ---
 
-Two files, pick what matches your tool:
+One entry point now: `node bin/cli.js` (or `npm start`). It asks which format you want, or you can skip the menu with a flag:
 
-| File | Format | Port | Use with |
-|------|--------|------|----------|
-| [`main.js`](./main.js) | OpenAI (`/v1/chat/completions`) | `18791` | OpenCode, Cursor, Continue, LiteLLM, Python/JS SDKs |
-| [`anthropic.js`](./anthropic.js) | Anthropic (`/v1/messages`) | `18792` | Claude Code CLI, Anthropic SDK |
+| Format | Flag | Port | Use with |
+|--------|------|------|----------|
+| OpenAI (`/v1/chat/completions`) | `--openai` (default) | `18791` | OpenCode, Cursor, Continue, LiteLLM, Python/JS SDKs |
+| Anthropic (`/v1/messages`) | `--anthropic` | `18792` | Claude Code CLI, Anthropic SDK |
 
 ## Screenshots
 
@@ -37,7 +39,7 @@ Make sure **AutoClaw is running and you're logged in**. The proxy reads auth fro
 Start the proxy and watch it handle requests from your tool of choice:
 
 <p align="center">
-  <i>Screenshot: Terminal showing <code>node main.js</code> startup with "Token loaded — ready", then requests being proxied through</i>
+  <i>Screenshot: Terminal showing <code>node bin/cli.js</code> startup with the format menu, then requests being proxied through</i>
   <br>
   <img src="./screenshots/proxy-working.png" alt="Proxy terminal showing successful operation" width="700">
 </p>
@@ -58,21 +60,27 @@ AutoClaw handles authentication automatically. As long as AutoClaw is running an
 
 ## Quick Start
 
-> **Coming soon to npm.** For now, run directly:
->
-> ```bash
-> node main.js                  # OpenAI format (port 18791)
-> node anthropic.js             # Anthropic format (port 18792)
-> ```
->
-> Once published:
-> ```bash
-> npx autoclaw-gateway
-> npm install -g autoclaw-gateway
-> autoclaw-gateway --anthropic  # or just autoclaw-gateway
-> ```
+**v2.0.0**: the CLI is the entry point now. No install step, no `node_modules` — just run it:
 
-When you see the dashboard banner, you're good to go.
+```bash
+npm start                  # or: node bin/cli.js
+```
+
+You get an interactive menu: arrow keys to move, Enter to pick. Choose the format, port, host, and auth key, and the proxy starts. Ctrl+C quits cleanly and restores your terminal.
+
+Skip the menu with flags:
+
+```bash
+node bin/cli.js --anthropic --port 3001 --key mykey
+```
+
+or feed config through env — the CLI leaves existing env vars alone:
+
+```bash
+PORT=3001 PROXY_KEY=mykey RATE_LIMIT=50 node main.js
+```
+
+When you see the dashboard banner, you're good to go. Without a TTY (piped stdin, CI) the CLI skips the menu and starts the OpenAI format with your env vars or defaults.
 
 Optional env vars / flags:
 
@@ -254,14 +262,14 @@ Any tool that supports OpenAI-compatible providers works. Point it at `http://lo
 - If a request fails with 400, the proxy retries once after a 2s delay before surfacing the error
 - Token file is watched for changes — AutoClaw can rotate auth mid-session without a restart
 - Rate limit is enforced per client IP (default 30 req/s, configurable via `RATE_LIMIT` or `--rate-limit`)
-- No dependencies beyond Node.js built-in modules — zero `node_modules`, zero install step
+- No dependencies at all: the interactive menu is hand-rolled on Node's built-in `readline`, so there's still zero `node_modules` and zero install step
 
 ## Publishing to npm
 
 Set up a GitHub secret `NPM_TOKEN` with your npm access token, then:
 
 ```bash
-git tag v1.0.1
+git tag v2.0.0
 git push --tags
 ```
 

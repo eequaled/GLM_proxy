@@ -18,7 +18,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "start": "node main.js",
+    "start": "node bin/cli.js",
     "anthropic": "node anthropic.js",
     "test": "node tests/pen-test-p1.mjs && node tests/pen-test-p2.mjs && node tests/pen-test-p3.mjs && node tests/pen-test-p4.mjs && node tests/pen-test-p5.mjs"
   },
