@@ -3,11 +3,12 @@
 import path from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { promptSelect, promptInput, promptNumber } from "../lib/prompts.js";
+import { getModelCatalog, loadConfig } from "../lib/core.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 
-const FLAGS = ["--anthropic", "--openai", "--port", "--host", "--key", "--rate-limit", "--help", "-h"];
+const FLAGS = ["--anthropic", "--openai", "--port", "--host", "--key", "--rate-limit", "--doctor", "--help", "-h"];
 
 function showHelp() {
   console.log(`
@@ -24,6 +25,7 @@ function showHelp() {
     --host <ip>       Host to bind (default: 127.0.0.1)
     --key <string>    Authentication key for clients (default: mewmew)
     --rate-limit <n>  Max requests per second per IP (default: 30)
+    --doctor          Scan AutoClaw's live model catalog and print routing targets
     --help, -h        Show this help message
   `);
   process.exit(0);
@@ -31,6 +33,30 @@ function showHelp() {
 
 if (args.includes("--help") || args.includes("-h")) {
   showHelp();
+}
+
+if (args.includes("--doctor")) {
+  const catalog = getModelCatalog(loadConfig({ defaultPort: 18791 }));
+  console.log(`\n  AutoClaw model doctor\n  ───────────────────────────────────────────`);
+  console.log(`  Source: ${catalog.source || "built-in fallback"}`);
+  console.log(`  Status: ${catalog.fallback ? "runtime catalog unavailable" : "runtime catalog loaded"}\n`);
+  catalog.models.forEach((model, index) => {
+    const context = model.contextWindow ? `${Math.round(model.contextWindow / 1024)}K context` : "context unknown";
+    const output = model.maxTokens ? `${Math.round(model.maxTokens / 1024)}K max output` : "output unknown";
+    console.log(`  ${index + 1}. ${model.name} (${model.id}) — ${context}, ${output}`);
+  });
+  const findModel = (...fragments) => {
+    for (const fragment of fragments) {
+      const match = catalog.models.find((model) => `${model.name} ${model.id}`.toLowerCase().includes(fragment));
+      if (match) return match.id;
+    }
+    return "zai_auto";
+  };
+  console.log(`\n  Anthropic routing:`);
+  console.log(`  claude-opus-*   → ${findModel("glm-5.3", "glm-5")}`);
+  console.log(`  claude-sonnet-* → ${findModel("auto", "glm-5.3", "glm-5")}`);
+  console.log(`  claude-haiku-*  → ${findModel("turbo", "deepseek", "auto")}\n`);
+  process.exit(0);
 }
 
 // Flag parsing

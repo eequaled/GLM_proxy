@@ -116,6 +116,7 @@ They read the same env vars and respect `HOST`, `PORT`, `PROXY_KEY`, `RATE_LIMIT
 | `JSONL_MAX_BYTES` | `10485760` | Rotate JSONL log when it exceeds this (10 MB) |
 | `--anthropic` | — | Run in Anthropic API format |
 | `--openai` | — | Run in OpenAI API format (default) |
+| `--doctor` | — | Scan AutoClaw's current runtime model catalog and show Anthropic routing |
 | `--help`, `-h` | — | Show CLI help |
 
 ### JSONL Request Logging
@@ -127,6 +128,16 @@ Set `JSONL_LOG=true` (or `LOG_LEVEL=debug`) to write one JSON line per request:
 ```
 
 The Anthropic variant writes to `proxy_requests_anthropic.jsonl`.
+
+### Model doctor
+
+Run the doctor command whenever AutoClaw updates to scan its live runtime catalog and show the routing targets the proxy will use:
+
+```bash
+node bin/cli.js --doctor
+```
+
+It reads AutoClaw's `openclaw.runtime.json` directly and falls back to the gateway's bundled catalog only if that runtime file is unavailable.
 
 ## API
 
@@ -163,19 +174,22 @@ Anthropic-compatible Messages API. Supports both streaming and non-streaming. Cl
 
 | Claude model | Routes to |
 |---|---|
-| `claude-opus-*` | `zaicoding_glm-5.2` |
-| `claude-sonnet-*` | `zai_auto` |
-| `claude-haiku-*` | `zai_glm-5-turbo` |
+| `claude-opus-*` | First available GLM-5.3 / GLM-5 model |
+| `claude-sonnet-*` | `zai_auto` (or next available GLM-5 model) |
+| `claude-haiku-*` | `zai_glm-5-turbo` (or DeepSeek / Auto fallback) |
 
 ## Models
 
 | ID | Name | Context | Max Output | Notes |
 |----|------|---------|------------|-------|
-| `zai_auto` | Auto | 1M | 393K | Routes to optimal model (DeepSeek-V4, GLM-5.1, GLM-Air, …) |
+| `zai_auto` | Auto | 1M | 393K | Routes to AutoClaw's optimal model |
+| `zaicoding_glm-5.3` | GLM-5.3 | 1M | 307K | Latest GLM coding model |
 | `zai_glm-5-turbo` | GLM-5-Turbo | 200K | 131K | Zhipu AI GLM-5 Turbo |
-| `zaicoding_glm-5.2` | GLM-5.2 | 1M | 307K | Latest GLM-5.2 coding model |
+| `tdpsk_deepseek-v4-flash-202605` | Deepseek-V4-Flash | 1M | 131K | Fast DeepSeek model |
 
-All models include `reasoning_content` in responses when the upstream model reasons. The model list is loaded from AutoClaw's `openclaw.runtime.json` at startup, with a built-in fallback if that file isn't readable.
+> GLM 5.3 new in the proxy? Maybe. Supposedly in the UI it's 5.2 but in the API it's 5.3. We'll never know, but it's a win-win xd.
+
+All models include `reasoning_content` in responses when the upstream model reasons. The model list is loaded dynamically from AutoClaw's `openclaw.runtime.json` at startup, with a built-in fallback if that file isn't readable. Run `node bin/cli.js --doctor` to inspect the current catalog after an AutoClaw update.
 
 ## Integrations
 
@@ -193,8 +207,9 @@ All models include `reasoning_content` in responses when the upstream model reas
       },
       "models": {
         "zai_auto": { "name": "AutoClaw Auto" },
+        "zaicoding_glm-5.3": { "name": "AutoClaw GLM-5.3" },
         "zai_glm-5-turbo": { "name": "AutoClaw GLM-5 Turbo" },
-        "zaicoding_glm-5.2": { "name": "AutoClaw GLM-5.2" }
+        "tdpsk_deepseek-v4-flash-202605": { "name": "AutoClaw Deepseek-V4-Flash" }
       }
     }
   }

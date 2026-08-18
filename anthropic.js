@@ -45,12 +45,21 @@ const { log } = createLogger(LOG_LEVEL);
 const { MODELS } = loadModelCatalog(config);
 
 // Resolve model roles dynamically from the loaded catalog
-const findById   = (id) => MODELS.find((m) => m.id === id);
-const findByName = (s)  => MODELS.find((m) => m.name.toLowerCase().includes(s.toLowerCase()));
-const opusModel   = MODELS.length >= 3 ? MODELS[MODELS.length - 1].id
-                    : findByName("5.2")?.id || findByName("glm-5")?.id || "zai_auto";
-const sonnetModel = findById("zai_auto")?.id     || "zai_auto";
-const haikuModel  = findById("zai_glm-5-turbo")?.id || findByName("turbo")?.id || "zai_glm-5-turbo";
+function findByName(fragment) {
+  return MODELS.find(m => (m.name + " " + m.id).toLowerCase().includes(fragment.toLowerCase()));
+}
+
+function preferredModel(...fragments) {
+  for (const fragment of fragments) {
+    const match = findByName(fragment);
+    if (match) return match.id;
+  }
+  return "zai_auto";
+}
+
+const opusModel   = preferredModel("glm-5.3", "glm-5", "auto");
+const sonnetModel = preferredModel("auto", "glm-5.3", "glm-5");
+const haikuModel  = preferredModel("turbo", "deepseek", "auto");
 
 const CLASS_MAP = [
   { pattern: /opus/i,   target: opusModel   },
