@@ -22,7 +22,7 @@
 
 import http from "http";
 import {
-  loadConfig, loadModelCatalog, createTokenLayer, createLogger,
+  loadConfig, loadModelCatalog, getModelCatalog, createTokenLayer, createLogger,
   sendJSON, sendErrorOpenAI, readBody, isAuthorized, generateId,
   collectResponse, createRateLimiter, clientIpOpenAI,
   createRequestLogger, createJsonlLogger, callUpstreamOpenAI,
@@ -32,7 +32,7 @@ import {
 // Config
 const config = loadConfig({ defaultPort: 18791 });
 const { log } = createLogger(config.LOG_LEVEL);
-const { MODELS, KNOWN_IDS } = loadModelCatalog(config);
+const { MODELS } = loadModelCatalog(config);
 const { getToken, invalidateToken, startWatch } = createTokenLayer(config, log);
 const { rateLimit, startBucketSweep } = createRateLimiter(config.RATE_LIMIT);
 const { logRequest } = createRequestLogger(config.REQUEST_LOG_FILE);
@@ -139,9 +139,10 @@ function handleHealth(res) {
 }
 
 function handleModels(res) {
+  const { models } = getModelCatalog(config);
   sendJSON(res, {
     object: "list",
-    data:   MODELS.map((m) => ({
+    data:   models.map((m) => ({
       id:             m.id,
       object:         "model",
       created:        Math.floor(Date.now() / 1000),
@@ -172,6 +173,8 @@ async function handleChatCompletions(req, res) {
   }
   const modelId = body.model;
   const stream  = body.stream !== false; // default true
+  const { models } = getModelCatalog(config);
+  const knownIds = new Set(models.map((m) => m.id));
 
   log.info(`chat model=${modelId} stream=${stream}`);
 
@@ -179,13 +182,13 @@ async function handleChatCompletions(req, res) {
   let upstreamErrBody = "";
   try {
     // 400 "invalid request" is AutoClaw's known transient hiccup — retry it once
-    upstreamRes = await callUpstreamOpenAI(KNOWN_IDS, config.CLIENT_HEADERS, getToken, body, modelId, log);
+    upstreamRes = await callUpstreamOpenAI(knownIds, config.CLIENT_HEADERS, getToken, body, modelId, log);
     if (upstreamRes.statusCode === 400) {
       upstreamErrBody = await collectResponse(upstreamRes);
       if (upstreamErrBody.includes('"invalid request"')) {
         log.info("Upstream 400 invalid request — retrying once");
         await new Promise(r => setTimeout(r, 2000));
-        upstreamRes = await callUpstreamOpenAI(KNOWN_IDS, config.CLIENT_HEADERS, getToken, body, modelId, log);
+        upstreamRes = await callUpstreamOpenAI(knownIds, config.CLIENT_HEADERS, getToken, body, modelId, log);
       }
     }
   } catch (err) {

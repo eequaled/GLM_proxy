@@ -21,7 +21,7 @@ import http from "http";
 import path from "path";
 
 import {
-  loadConfig, loadModelCatalog,
+  loadConfig, loadModelCatalog, getModelCatalog,
   createLogger, createTokenLayer,
   sendJSON, sendErrorAnthropic, readBody, isAuthorized, generateId, collectResponse,
   createRateLimiter, clientIpAnthropic,
@@ -44,30 +44,14 @@ const { log } = createLogger(LOG_LEVEL);
 // Model catalog
 const { MODELS } = loadModelCatalog(config);
 
-// Resolve model roles dynamically from the loaded catalog
-function findByName(fragment) {
-  return MODELS.find(m => (m.name + " " + m.id).toLowerCase().includes(fragment.toLowerCase()));
-}
-
-function preferredModel(...fragments) {
+// Resolve model roles from the current runtime catalog.
+function preferredModel(models, ...fragments) {
   for (const fragment of fragments) {
-    const match = findByName(fragment);
+    const match = models.find((m) => `${m.name} ${m.id}`.toLowerCase().includes(fragment));
     if (match) return match.id;
   }
   return "zai_auto";
 }
-
-const opusModel   = preferredModel("glm-5.3", "glm-5", "auto");
-const sonnetModel = preferredModel("auto", "glm-5.3", "glm-5");
-const haikuModel  = preferredModel("turbo", "deepseek", "auto");
-
-const CLASS_MAP = [
-  { pattern: /opus/i,   target: opusModel   },
-  { pattern: /sonnet/i, target: sonnetModel },
-  { pattern: /haiku/i,  target: haikuModel  },
-];
-
-const DEFAULT_MODEL = sonnetModel;
 
 // Token layer
 const { getToken, invalidateToken, startWatch } = createTokenLayer(config, log);
@@ -88,12 +72,16 @@ const sendError = sendErrorAnthropic;
 
 // Format conversion (Anthropic <-> OpenAI)
 
-// Resolve any Anthropic model name to an AutoClaw model ID.
+// Resolve any Anthropic model name to a current AutoClaw model ID.
 function resolveModel(anthropicModel) {
-  if (!anthropicModel) return DEFAULT_MODEL;
-  if (MODELS.some((m) => m.id === anthropicModel)) return anthropicModel;
-  const match = CLASS_MAP.find((c) => c.pattern.test(anthropicModel));
-  return match ? match.target : DEFAULT_MODEL;
+  const { models } = getModelCatalog(config);
+  const defaultModel = preferredModel(models, "auto", "glm-5.3", "glm-5");
+  if (!anthropicModel) return defaultModel;
+  if (models.some((m) => m.id === anthropicModel)) return anthropicModel;
+  if (/opus/i.test(anthropicModel)) return preferredModel(models, "glm-5.3", "glm-5", "auto");
+  if (/sonnet/i.test(anthropicModel)) return defaultModel;
+  if (/haiku/i.test(anthropicModel)) return preferredModel(models, "turbo", "deepseek", "auto");
+  return defaultModel;
 }
 
 // Convert an Anthropic Messages request body to OpenAI chat/completions format.
@@ -418,16 +406,17 @@ function handleHealth(res) {
 }
 
 function handleModels(res) {
+  const { models } = getModelCatalog(config);
   sendJSON(res, {
-    data: MODELS.map((m) => ({
+    data: models.map((m) => ({
       type:         "model",
       id:           m.id,
       display_name: m.name,
       created_at:   new Date().toISOString(),
     })),
     has_more: false,
-    first_id: MODELS[0].id,
-    last_id:  MODELS[MODELS.length - 1].id,
+    first_id: models[0].id,
+    last_id:  models[models.length - 1].id,
   });
 }
 
