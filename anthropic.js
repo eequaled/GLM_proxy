@@ -1,7 +1,7 @@
 /**
  * AutoClaw Proxy - Anthropic format
  *
- * Same as main.js but speaks the Anthropic Messages API instead of OpenAI.
+ * Same as openai.js but speaks the Anthropic Messages API instead of OpenAI.
  * Use this with Claude Code CLI or any tool that targets the Anthropic SDK.
  *
  * Usage:
@@ -21,12 +21,13 @@ import http from "http";
 import path from "path";
 
 import {
-  loadConfig, loadModelCatalog,
+  loadConfig, loadModelCatalog, getModelCatalog,
   createLogger, createTokenLayer,
-  sendJSON, sendErrorAnthropic, readBody, isAuthorized, generateId, collectResponse,
+  sendJSON, sendErrorAnthropic, readBody, validateChatPayload, isAuthorized, generateId, collectResponse,
   createRateLimiter, clientIpAnthropic,
   createRequestLogger, createJsonlLogger,
-  callUpstreamAnthropic,
+  callUpstreamAnthropic, streamLocalGatewayAgent, getLocalGatewayToken,
+  getUpstreamErrorMessage, translateUpstreamError,
   BOX_W, boxRow,
 } from "./lib/core.js";
 
@@ -76,7 +77,7 @@ startWatch();
 // Request loggers
 const { logRequest } = createRequestLogger(config.REQUEST_LOG_FILE);
 const { logJsonl } = createJsonlLogger({
-  enabled: config.JSONL_LOG, file: config.JSONL_FILE, maxBytes: config.JSONL_MAX_BYTES,
+  enabled: config.JSONL_LOG, sync: config.JSONL_SYNC, file: config.JSONL_FILE, maxBytes: config.JSONL_MAX_BYTES,
 });
 
 // Rate limiter
@@ -90,8 +91,9 @@ const sendError = sendErrorAnthropic;
 
 // Resolve any Anthropic model name to an AutoClaw model ID.
 function resolveModel(anthropicModel) {
+  const { models } = getModelCatalog(config);
   if (!anthropicModel) return DEFAULT_MODEL;
-  if (MODELS.some((m) => m.id === anthropicModel)) return anthropicModel;
+  if (models.some((m) => m.id === anthropicModel)) return anthropicModel;
   const match = CLASS_MAP.find((c) => c.pattern.test(anthropicModel));
   return match ? match.target : DEFAULT_MODEL;
 }
@@ -418,16 +420,18 @@ function handleHealth(res) {
 }
 
 function handleModels(res) {
+  const { models } = getModelCatalog(config);
+  const data = models.map((m) => ({
+    type:         "model",
+    id:           m.id,
+    display_name: m.name,
+    created_at:   new Date().toISOString(),
+  }));
   sendJSON(res, {
-    data: MODELS.map((m) => ({
-      type:         "model",
-      id:           m.id,
-      display_name: m.name,
-      created_at:   new Date().toISOString(),
-    })),
+    data,
     has_more: false,
-    first_id: MODELS[0].id,
-    last_id:  MODELS[MODELS.length - 1].id,
+    first_id: data[0]?.id ?? null,
+    last_id:  data[data.length - 1]?.id ?? null,
   });
 }
 
@@ -441,8 +445,8 @@ async function handleMessages(req, res) {
     return sendError(res, err.message, "invalid_request", status);
   }
 
-  if (!body.model || typeof body.model !== "string" || body.model.length > 256) {
-    return sendError(res, "model must be a non-empty string (max 256 chars)", "invalid_request", 400);
+  if (!body.model || typeof body.model !== "string" || body.model.length > 256 || body.model.includes("..") || /[\r\n\0]/.test(body.model)) {
+    return sendError(res, "model must be a valid non-empty string (max 256 chars)", "invalid_request", 400);
   }
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return sendError(res, "messages must be a non-empty array", "invalid_request", 400);
@@ -451,6 +455,10 @@ async function handleMessages(req, res) {
   const modelId    = resolveModel(body.model);
   const stream     = body.stream === true;
   const openAIBody = anthropicToOpenAI(body, modelId);
+  const payloadError = validateChatPayload(openAIBody);
+  if (payloadError) {
+    return sendError(res, payloadError.message, "invalid_request", payloadError.statusCode);
+  }
 
   log.info(`messages model=${body.model} -> ${modelId} stream=${stream}`);
 
@@ -458,18 +466,102 @@ async function handleMessages(req, res) {
   let upstreamErrBody = "";
   try {
     upstreamRes = await callUpstreamAnthropic(config.CLIENT_HEADERS, getToken, openAIBody, modelId);
+    // Retry once on transient 400 "invalid request" before trying fallbacks
     if (upstreamRes.statusCode === 400) {
       upstreamErrBody = await collectResponse(upstreamRes);
       if (upstreamErrBody.includes('"invalid request"')) {
         log.info("Upstream 400 invalid request — retrying once");
         await new Promise(r => setTimeout(r, 2000));
         upstreamRes = await callUpstreamAnthropic(config.CLIENT_HEADERS, getToken, openAIBody, modelId);
+        if (upstreamRes.statusCode >= 200 && upstreamRes.statusCode < 400) {
+          upstreamErrBody = "";
+        } else {
+          upstreamErrBody = await collectResponse(upstreamRes);
+        }
+      }
+    } else if (upstreamRes.statusCode === 401) {
+      upstreamErrBody = await collectResponse(upstreamRes);
+    }
+
+    if ((upstreamRes.statusCode === 400 || upstreamRes.statusCode === 401) && upstreamErrBody) {
+      if (getLocalGatewayToken()) {
+        log.info(`Anthropic upstream ${upstreamRes.statusCode} — executing via local AutoClaw WebSocket agent...`);
+        return new Promise((resolve) => {
+          let fullContent = "";
+          let streamedStart = false;
+
+          streamLocalGatewayAgent({
+            modelId,
+            messages: openAIBody.messages,
+            onChunk: ({ delta }) => {
+              if (stream) {
+                if (!streamedStart) {
+                  streamedStart = true;
+                  res.writeHead(200, {
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                  });
+                  res.write(fmt("message_start", {
+                    type: "message_start",
+                    message: {
+                      id: `msg_${generateId()}`, type: "message", role: "assistant",
+                      model: body.model, content: [], stop_reason: null, stop_sequence: null,
+                      usage: { input_tokens: 0, output_tokens: 0 },
+                    },
+                  }));
+                  res.write(fmt("content_block_start", {
+                    type: "content_block_start", index: 0,
+                    content_block: { type: "text", text: "" },
+                  }));
+                }
+                res.write(fmt("content_block_delta", {
+                  type: "content_block_delta", index: 0,
+                  delta: { type: "text_delta", text: delta },
+                }));
+              } else {
+                fullContent += delta;
+              }
+            },
+            onEnd: ({ finishReason }) => {
+              if (stream) {
+                res.write(fmt("content_block_stop", { type: "content_block_stop", index: 0 }));
+                res.write(fmt("message_delta", {
+                  type: "message_delta",
+                  delta: { stop_reason: finishReason === "stop" ? "end_turn" : finishReason, stop_sequence: null },
+                  usage: { output_tokens: 0 },
+                }));
+                res.write(fmt("message_stop", { type: "message_stop" }));
+                res.end();
+                resolve();
+              } else {
+                sendJSON(res, {
+                  id: `msg_${generateId()}`,
+                  type: "message",
+                  role: "assistant",
+                  model: body.model,
+                  content: [{ type: "text", text: fullContent }],
+                  stop_reason: finishReason === "stop" ? "end_turn" : finishReason,
+                  stop_sequence: null,
+                  usage: { input_tokens: 0, output_tokens: 0 },
+                });
+                resolve();
+              }
+            },
+            onError: (err) => {
+              log.warn(`Local gateway execution failed: ${err.message}`);
+              sendError(res, getUpstreamErrorMessage(upstreamErrBody || err.message), "api_error", upstreamRes.statusCode);
+              resolve();
+            }
+          });
+        });
       }
     }
   } catch (err) {
     const status = err.message.includes("Cannot read AutoClaw token") ? 503 : 502;
     logJsonl({ model: modelId, status, ip: clientIpAnthropic(req), latencyMs: Date.now() - startTime, error: "upstream_error" });
-    return sendError(res, err.message, "api_error", status);
+    return sendError(res, translateUpstreamError(err.message), "api_error", status);
   }
 
   log.debug(`upstream status=${upstreamRes.statusCode}`);
@@ -495,14 +587,9 @@ async function handleMessages(req, res) {
 
   if (upstreamRes.statusCode >= 400) {
     const errBody = upstreamErrBody || await collectResponse(upstreamRes);
-    try {
-      const parsed = JSON.parse(errBody);
-      log.error(`Upstream error ${upstreamRes.statusCode}:`, parsed.error?.message || errBody);
-      sendJSON(res, parsed, upstreamRes.statusCode);
-    } catch {
-      log.error(`Upstream error ${upstreamRes.statusCode}:`, errBody);
-      sendError(res, errBody || "Upstream error", "api_error", upstreamRes.statusCode);
-    }
+    const message = getUpstreamErrorMessage(errBody);
+    log.error(`Upstream error ${upstreamRes.statusCode}:`, message);
+    sendError(res, message, "api_error", upstreamRes.statusCode);
     return;
   }
 
