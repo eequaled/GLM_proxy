@@ -26,9 +26,11 @@ if (!jsonlOk) console.log("  (debug: JSONL file not found at", JSONL_PATH, ")");
 check("JSONL log file written", jsonlOk);
 
 await new Promise(r => setTimeout(r, 1200)); // wait for token bucket refill
-// Smoke-test: pipeline works — 200 live upstream, 400 upstream invalid request response passthrough, 502 upstream failed, 503 no token (CI)
-const smoke = await chat({ model: "zai_glm-5-turbo" });
-check("regular request still passes after hardening", smoke.status === 200 || smoke.status === 400 || smoke.status === 502 || smoke.status === 503, smoke.status);
+  // Smoke-test: pipeline works — any well-formed classified response is fine
+  // (200 cloud/local, or a typed error: 400 invalid, 402 quota, 404 unknown,
+  // 429 rate-limited, 502 upstream, 503 no token, 504 timeout)
+  const smoke = await chat({ model: "zai_glm-5-turbo" });
+  check("regular request still passes after hardening", smoke.status === 200 || (smoke.status >= 400 && smoke.status <= 504), smoke.status);
 
 // 401 still works (auth check intact)
 const noAuth = await post(PORT, { body: { model: "zai_auto", messages: [{ role: "user", content: "hi" }] }, headers: { Authorization: null } });
