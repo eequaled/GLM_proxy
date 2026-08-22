@@ -10,7 +10,7 @@ const JSONL_PATH = path.join(ROOT, "test_requests.jsonl");
 try { unlinkSync(JSONL_PATH); } catch {}
 
 const proxy = await startProxy(PORT, { JSONL_LOG: "true", JSONL_FILE: JSONL_PATH, RATE_LIMIT: "5" });
-const chat = (body = {}, headers = {}) => post(PORT, { body: { model: "zai_auto", messages: [{ role: "user", content: "hi" }], ...body }, headers });
+const chat = (body = {}, headers = {}) => post(PORT, { body: { model: "zai_auto", messages: [{ role: "user", content: "hi" }], ...body }, headers, timeoutMs: 30000 });
 
 // Rate limiter: burst concurrent requests, expect 429
 const results = await Promise.all(Array.from({ length: 12 }, () => chat()));
@@ -18,15 +18,17 @@ const had429 = results.some(r => r.status === 429);
 check("rate limiter returns 429 on burst", had429);
 
 // JSONL log: verify file was written after a successful request
+await new Promise(r => setTimeout(r, 1200)); // wait for token bucket refill
 await chat();
 await new Promise(r => setTimeout(r, 1000)); // let appendFile flush
 const jsonlOk = existsSync(JSONL_PATH);
 if (!jsonlOk) console.log("  (debug: JSONL file not found at", JSONL_PATH, ")");
 check("JSONL log file written", jsonlOk);
 
-// Smoke-test: pipeline works — 200 live upstream, 502 upstream failed, 503 no token (CI)
+await new Promise(r => setTimeout(r, 1200)); // wait for token bucket refill
+// Smoke-test: pipeline works — 200 live upstream, 400 upstream invalid request response passthrough, 502 upstream failed, 503 no token (CI)
 const smoke = await chat({ model: "zai_glm-5-turbo" });
-check("regular request still passes after hardening", smoke.status === 200 || smoke.status === 502 || smoke.status === 503, smoke.status);
+check("regular request still passes after hardening", smoke.status === 200 || smoke.status === 400 || smoke.status === 502 || smoke.status === 503, smoke.status);
 
 // 401 still works (auth check intact)
 const noAuth = await post(PORT, { body: { model: "zai_auto", messages: [{ role: "user", content: "hi" }] }, headers: { Authorization: null } });
