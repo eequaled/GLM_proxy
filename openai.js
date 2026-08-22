@@ -1,49 +1,59 @@
 /**
- * AutoClaw Proxy
+ * AutoClaw Proxy — OpenAI-format entrypoint.
  *
- * OpenAI-compatible HTTP proxy for AutoClaw's Zhipu AI backend.
+ * Owns ONLY the endpoint surface and wire format:
+ *   POST /v1/chat/completions (+ OpenAI SSE passthrough / non-stream assembly)
+ *   GET  /v1/models (OpenAI list shape)
+ * All shared machinery — config, tokens, catalog, upstream calls, the local
+ * WebSocket fallback, error classification, logging, server bootstrap — lives
+ * in lib/core.js.
  *
- * How it works (same pattern as antigravity-claude-proxy / acc):
- *   AutoClaw keeps a fresh JWT at ~/.openclaw-autoclaw/request-headers.json,
- *   auto-refreshed whenever it rotates. We read that file on startup and
- *   re-read it every TOKEN_TTL_MS — zero manual auth setup required.
- *
- *   Requests are forwarded to AutoClaw's real OpenAI-compatible API:
- *   https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw/v1/chat/completions
+ * How auth works: AutoClaw keeps a fresh JWT at
+ * ~/.openclaw-autoclaw/request-headers.json, auto-refreshed whenever it
+ * rotates. We read that file on startup and re-read every TOKEN_TTL_MS —
+ * zero manual auth setup required.
  *
  * Usage:
  *   node openai.js
- *   PORT=3001 node openai.js
+ *   PORT=3001 PREFER_LOCAL=1 node openai.js
  *
  * OpenCode / any OpenAI-compatible client:
  *   baseURL : http://localhost:18791/v1
  *   apiKey  : (value of PROXY_KEY env, default "mewmew")
  */
 
-import http from "http";
 import {
   loadConfig, loadModelCatalog, getModelCatalog, createTokenLayer, createLogger,
-  sendJSON, sendErrorOpenAI, readBody, validateChatPayload, isAuthorized, generateId,
-  collectResponse, createRateLimiter, clientIpOpenAI,
-  createRequestLogger, createJsonlLogger, callUpstreamOpenAI,
-  streamLocalGatewayAgent, getLocalGatewayToken, getUpstreamErrorMessage, translateUpstreamError,
-  BOX_W, boxRow,
+  createRateLimiter, createRequestLogger, createJsonlLogger,
+  makeHealthHandler, createGatewayServer, printStartupBanner, installProcessGuards,
+  sendJSON, sendErrorOpenAI, sendClassifiedErrorOpenAI, resolveClientIp,
+  readBody, validateChatPayload, generateId, collectResponse,
+  callUpstreamOpenAI, streamLocalGatewayAgent, getLocalGatewayToken,
+  classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
+  shouldFallbackToLocal, createPermanentFailureCache,
 } from "./lib/core.js";
 
 // Config
-const config = loadConfig({ defaultPort: 18791 });
+const config = loadConfig({ defaultPort: 18791, format: "openai" });
 const { log } = createLogger(config.LOG_LEVEL);
-const { MODELS, KNOWN_IDS } = loadModelCatalog(config);
+const { MODELS } = loadModelCatalog(config);
 const { getToken, invalidateToken, startWatch } = createTokenLayer(config, log);
 const { rateLimit, startBucketSweep } = createRateLimiter(config.RATE_LIMIT);
 const { logRequest } = createRequestLogger(config.REQUEST_LOG_FILE);
 const { logJsonl } = createJsonlLogger({ enabled: config.JSONL_LOG, sync: config.JSONL_SYNC, file: config.JSONL_FILE, maxBytes: config.JSONL_MAX_BYTES });
 
+// Remembers models that failed PERMANENTLY (quota exhausted, unknown id) so
+// repeat requests fail instantly instead of replaying doomed attempts.
+const permanentFailures = createPermanentFailureCache();
+
+// A rotated token can also mean un-quota'd state changed — drop both caches.
+function invalidateAuth() {
+  invalidateToken();
+  permanentFailures.clear();
+}
+
 startWatch();
 startBucketSweep();
-
-// Alias so all existing call sites stay unchanged
-const sendError = sendErrorOpenAI;
 
 // SSE buffering (OpenAI-specific: assemble streamed chunks into a single response)
 function bufferSSE(upstreamRes, modelId) {
@@ -86,14 +96,11 @@ function bufferSSE(upstreamRes, modelId) {
         // Build sorted tool_calls array
         const sortedToolCalls = Object.keys(toolCalls)
           .sort((a, b) => Number(a) - Number(b))
-          .map((idx) => {
-            const tc = toolCalls[idx];
-            return {
-              id: tc.id,
-              type: "function",
-              function: { name: tc.name, arguments: tc.arguments },
-            };
-          });
+          .map((idx) => ({
+            id: toolCalls[idx].id,
+            type: "function",
+            function: { name: toolCalls[idx].name, arguments: toolCalls[idx].arguments },
+          }));
 
         resolve({
           id,
@@ -125,21 +132,7 @@ function bufferSSE(upstreamRes, modelId) {
 
 // Routes
 
-function handleHealth(res) {
-  let tokenOk = true, tokenError = null;
-  try   { getToken(); }
-  catch (e) { tokenOk = false; tokenError = e.message; }
-
-  sendJSON(res, {
-    ok:       tokenOk,
-    status:   tokenOk ? "live" : "no_token",
-    upstream: config.UPSTREAM_BASE,
-    port:     config.PORT,
-    ...(tokenError ? { error: tokenError } : {}),
-  });
-}
-
-function handleModels(res) {
+function handleModels(req, res) {
   const { models } = getModelCatalog(config);
   sendJSON(res, {
     object: "list",
@@ -158,24 +151,47 @@ function handleModels(res) {
 
 async function handleChatCompletions(req, res) {
   const startTime = Date.now();
+  const clientIp  = resolveClientIp(req);
+
+  // Exactly one observability entry per request, written at the terminal
+  // outcome — cloud-served AND local-agent-served alike (`via` marks which).
+  let recorded = false;
+  function record(status, { model = null, lastMessage = null, messageCount = 0, error, via = "cloud" } = {}) {
+    if (recorded) return;
+    recorded = true;
+    if (model) {
+      logRequest({
+        timestamp: new Date().toISOString(),
+        model, status, via,
+        last_message: typeof lastMessage === "string"
+          ? lastMessage.substring(0, 300)
+          : JSON.stringify(lastMessage)?.substring(0, 300) ?? "",
+        ...(messageCount ? { message_count: messageCount } : {}),
+        ...(error ? { error } : {}),
+      });
+    }
+    logJsonl({ model, status, ip: clientIp, latencyMs: Date.now() - startTime, ...(via !== "cloud" ? { via } : {}), ...(error ? { error } : {}) });
+  }
+
   let body;
   try {
     body = await readBody(req, config.MAX_BODY_BYTES);
   } catch (err) {
-    const status = err.statusCode || 400;
-    logJsonl({ model: null, status, ip: clientIpOpenAI(req), latencyMs: Date.now() - startTime, error: "invalid_request" });
-    return sendError(res, err.message, "invalid_request", status);
+    record(err.statusCode || 400, { error: "invalid_request" });
+    return sendErrorOpenAI(res, err.message, "invalid_request_error", err.statusCode || 400, "invalid_request");
   }
-  // Input validation
+
+  // Input validation — model field first (it drives everything downstream)
   if (!body.model || typeof body.model !== "string" || body.model.length > 256 || body.model.includes("..") || /[\r\n\0]/.test(body.model)) {
-    logJsonl({ model: null, status: 400, ip: clientIpOpenAI(req), latencyMs: Date.now() - startTime, error: "invalid_request" });
-    return sendError(res, "model must be a valid non-empty string (max 256 chars)", "invalid_request", 400);
+    record(400, { error: "invalid_request" });
+    return sendErrorOpenAI(res, "model must be a valid non-empty string (max 256 chars)", "invalid_request_error", 400, "invalid_model");
   }
   const payloadError = validateChatPayload(body);
   if (payloadError) {
-    logJsonl({ model: body.model, status: payloadError.statusCode, ip: clientIpOpenAI(req), latencyMs: Date.now() - startTime, error: "invalid_request" });
-    return sendError(res, payloadError.message, "invalid_request", payloadError.statusCode);
+    record(payloadError.statusCode, { model: body.model, error: "payload_too_large" });
+    return sendErrorOpenAI(res, payloadError.message, "invalid_request_error", payloadError.statusCode, "invalid_payload");
   }
+
   const modelId = body.model;
   const stream  = body.stream !== false; // default true
   const { models } = getModelCatalog(config);
@@ -183,15 +199,21 @@ async function handleChatCompletions(req, res) {
 
   log.info(`chat model=${modelId} stream=${stream}`);
 
-  let upstreamRes;
-  let upstreamErrBody = "";
+  const lastMsgForLog = () => {
+    const lastMsg = body.messages?.[body.messages.length - 1];
+    return typeof lastMsg?.content === "string" ? lastMsg.content : JSON.stringify(lastMsg?.content) ?? "";
+  };
 
+  // Local AutoClaw WebSocket agent fallback. Returns true when the response
+  // was fully handled here (success OR terminal error), false when the local
+  // gateway is simply unavailable.
   const tryLocalAgent = () => {
-    if (!getLocalGatewayToken()) return false;
+    if (!getLocalGatewayToken()) return Promise.resolve(false);
     log.info(`Executing chat model=${modelId} via local AutoClaw WebSocket agent...`);
     return new Promise((resolve) => {
       let fullContent = "";
       let streamedHeader = false;
+      const startedAt = Date.now();
 
       streamLocalGatewayAgent({
         modelId,
@@ -229,7 +251,6 @@ async function handleChatCompletions(req, res) {
               choices: [{ index: 0, delta: {}, finish_reason: finishReason || "stop" }],
             });
             res.end(`data: ${finalChunk}\n\ndata: [DONE]\n\n`);
-            resolve(true);
           } else {
             sendJSON(res, {
               id: `chatcmpl-${generateId()}`,
@@ -239,161 +260,160 @@ async function handleChatCompletions(req, res) {
               choices: [{ index: 0, message: { role: "assistant", content: fullContent }, finish_reason: finishReason || "stop" }],
               usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
             });
-            resolve(true);
           }
+          log.info(`chat model=${modelId} served via local agent (${Date.now() - startedAt}ms)`);
+          record(200, { model: modelId, lastMessage: fullContent, messageCount: body.messages?.length || 0, via: "local" });
+          resolve(true);
         },
         onError: (err) => {
           log.warn(`Local gateway execution failed: ${err.message}`);
-          sendError(res, getUpstreamErrorMessage(upstreamErrBody || err.message), "api_error", 502);
+          const cls = classifyLocalAgentError(err, modelId);
+          permanentFailures.mark(modelId, cls);
+          if (res.headersSent) {
+            // SSE already went out with 200 — a JSON 502 cannot follow.
+            // Terminate the stream instead of throwing ERR_HTTP_HEADERS_SENT.
+            try { res.end(); } catch (_) {}
+            record(cls.status, { model: modelId, error: `${cls.code} (mid-stream)`, via: "local" });
+          } else {
+            record(cls.status, { model: modelId, error: cls.code, via: "local" });
+            sendClassifiedErrorOpenAI(res, cls);
+          }
           resolve(true);
-        }
+        },
       });
     });
   };
 
-  try {
-    upstreamRes = await callUpstreamOpenAI(knownIds, config.CLIENT_HEADERS, getToken, body, modelId, log);
-    if (upstreamRes.statusCode === 400) {
-      upstreamErrBody = await collectResponse(upstreamRes);
-      if (upstreamErrBody.includes('"invalid request"')) {
-        log.info("Upstream 400 invalid request — retrying once");
-        await new Promise(r => setTimeout(r, 2000));
-        upstreamRes = await callUpstreamOpenAI(knownIds, config.CLIENT_HEADERS, getToken, body, modelId, log);
-        if (upstreamRes.statusCode >= 200 && upstreamRes.statusCode < 400) {
-          upstreamErrBody = "";
-        } else {
-          upstreamErrBody = await collectResponse(upstreamRes);
-        }
-      }
-    } else if (upstreamRes.statusCode === 401) {
-      upstreamErrBody = await collectResponse(upstreamRes);
+  // Terminal success handling shared by first-attempt and retried responses.
+  async function respondSuccess(successRes) {
+    record(successRes.statusCode, { model: modelId, lastMessage: lastMsgForLog(), messageCount: body.messages?.length || 0 });
+    log.debug(`← upstream status=${successRes.statusCode}`);
+
+    if (stream) {
+      res.writeHead(200, {
+        "Content-Type":    "text/event-stream",
+        "Cache-Control":   "no-cache",
+        "Connection":      "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      successRes.pipe(res);
+      return;
     }
 
-    if (upstreamRes.statusCode >= 400 && upstreamRes.statusCode !== 404 && upstreamRes.statusCode !== 429) {
-      if (!upstreamErrBody) upstreamErrBody = await collectResponse(upstreamRes);
+    // Non-stream: buffer SSE, assemble full response object
+    try {
+      sendJSON(res, await bufferSSE(successRes, modelId));
+    } catch (err) {
+      if (!res.headersSent) sendErrorOpenAI(res, err.message, "api_error", 502, "upstream_parse_failed");
+      else { try { res.end(); } catch (_) {} }
+    }
+  }
+
+  try {
+    // PREFER_LOCAL=1: skip the cloud attempt entirely when the desktop
+    // gateway is up — saves doomed round-trips while credits are exhausted.
+    if (config.PREFER_LOCAL && getLocalGatewayToken()) {
       if (await tryLocalAgent()) return;
     }
+
+    // Known-permanent failure within the TTL → answer instantly, identically.
+    const cachedFailure = permanentFailures.get(modelId);
+    if (cachedFailure) {
+      log.info(`chat model=${modelId} short-circuited: ${cachedFailure.code} (recently confirmed)`);
+      record(cachedFailure.status, { model: modelId, error: cachedFailure.code });
+      return sendClassifiedErrorOpenAI(res, cachedFailure);
+    }
+
+    let upstreamErrBody = "";
+    let upstreamRes = await callUpstreamOpenAI(knownIds, config.CLIENT_HEADERS, getToken, body, modelId, log);
+    const statusCode  = upstreamRes.statusCode;
+
+    // One retry for the historically flaky 400 "invalid request" hiccup —
+    // but never for a model we've already confirmed permanently broken.
+    if (statusCode === 400) {
+      upstreamErrBody = await collectResponse(upstreamRes);
+      if (upstreamErrBody.includes('"invalid request"') && !permanentFailures.get(modelId)) {
+        log.info("Upstream 400 invalid request — retrying once");
+        await new Promise(r => setTimeout(r, 2000));
+        const retried = await callUpstreamOpenAI(knownIds, config.CLIENT_HEADERS, getToken, body, modelId, log);
+        if (retried.statusCode < 400) {
+          return respondSuccess(retried);
+        }
+        upstreamRes = retried;
+        upstreamErrBody = await collectResponse(retried);
+      }
+    } else if (statusCode === 401) {
+      upstreamErrBody = await collectResponse(upstreamRes);
+    }
+
+    const effectiveStatus = upstreamRes.statusCode;
+
+    // Rotate-out token caches BEFORE deciding fallback so the very next
+    // request picks up the fresh JWT regardless of who serves this one.
+    if (effectiveStatus === 401) invalidateAuth();
+
+    if (shouldFallbackToLocal(effectiveStatus)) {
+      const cls = classifyUpstreamError(effectiveStatus, upstreamErrBody, modelId);
+      if (cls.permanent) permanentFailures.mark(modelId, cls);
+      log.error(`Upstream error ${effectiveStatus}:`, cls.message);
+
+      // The desktop gateway shares this AutoClaw account — a quota/plan wall
+      // stops it too, so don't march a known-permanent failure into it.
+      if (!cls.permanent || !permanentFailures.get(modelId)) {
+        if (await tryLocalAgent()) return;
+      } else {
+        log.info(`Skipping local fallback for ${modelId}: ${cls.code} is account-wide`);
+      }
+
+      record(cls.status, { model: modelId, lastMessage: lastMsgForLog(), messageCount: body.messages?.length || 0, error: cls.code });
+      return sendClassifiedErrorOpenAI(res, cls);
+    }
+
+    return respondSuccess(upstreamRes);
   } catch (err) {
-    if (await tryLocalAgent()) return;
-    const status  = err.message.includes("Cannot read AutoClaw token") ? 503 : 502;
-    const errType = status === 503 ? "service_unavailable" : "upstream_error";
-    const message = translateUpstreamError(err.message);
-    logJsonl({ model: modelId, status, ip: clientIpOpenAI(req), latencyMs: Date.now() - startTime, error: errType });
-    return sendError(res, message, errType, status);
-  }
-
-  log.debug(`← upstream status=${upstreamRes.statusCode}`);
-
-  // Save request details + status to file (not terminal)
-  const lastMsg = body.messages?.[body.messages.length - 1];
-  logRequest({
-    timestamp: new Date().toISOString(),
-    model: modelId,
-    status: upstreamRes.statusCode,
-    last_message: typeof lastMsg?.content === "string"
-      ? lastMsg.content.substring(0, 300)
-      : JSON.stringify(lastMsg?.content).substring(0, 300),
-    message_count: body.messages?.length || 0,
-  });
-
-  logJsonl({ model: modelId, status: upstreamRes.statusCode, ip: clientIpOpenAI(req), latencyMs: Date.now() - startTime });
-
-  // 401 → invalidate cached token so next request gets a fresh one
-  if (upstreamRes.statusCode === 401) {
-    invalidateToken();
-    return sendError(res,
-      "AutoClaw token expired — invalidated cache, retry the request",
-      "authentication_error", 401
-    );
-  }
-
-  // Normalize upstream failures to the OpenAI error shape and translate known messages.
-  if (upstreamRes.statusCode >= 400) {
-    const errBody = upstreamErrBody || await collectResponse(upstreamRes);
-    const message = getUpstreamErrorMessage(errBody);
-    log.error(`Upstream error ${upstreamRes.statusCode}:`, message);
-    sendError(res, message, "api_error", upstreamRes.statusCode);
-    return;
-  }
-
-  if (stream) {
-    // Pipe SSE straight through to the client
-    res.writeHead(200, {
-      "Content-Type":    "text/event-stream",
-      "Cache-Control":   "no-cache",
-      "Connection":      "keep-alive",
-      "X-Accel-Buffering": "no",
-    });
-    upstreamRes.pipe(res);
-    return;
-  }
-
-  // Non-stream: buffer SSE, assemble full response object
-  try {
-    const response = await bufferSSE(upstreamRes, modelId);
-    sendJSON(res, response);
-  } catch (err) {
-    sendError(res, err.message, "api_error", 502);
+    // Transport-level failure (no HTTP response at all): dead token, connect
+    // reset, upstream timeout…
+    const cls = classifyTransportError(err);
+    log.error(`chat model=${modelId} transport failure:`, cls.message);
+    if (!res.headersSent && shouldFallbackToLocal(cls.status)) {
+      if (await tryLocalAgent()) return;
+    }
+    if (res.headersSent) { try { res.end(); } catch (_) {} return; }
+    record(cls.status, { model: modelId, lastMessage: lastMsgForLog(), messageCount: body.messages?.length || 0, error: cls.code });
+    return sendClassifiedErrorOpenAI(res, cls);
   }
 }
 
 // Server
 
-const server = http.createServer(async (req, res) => {
-  // CORS — allow all origins so any local tool can talk to this proxy
-  res.setHeader("Access-Control-Allow-Origin",  "*");
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key");
-
-  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
-
-  const clientIp = clientIpOpenAI(req);
-  if (!isAuthorized(req, config.PROXY_KEY)) {
-    logJsonl({ model: null, status: 401, ip: clientIp, latencyMs: 0, error: "auth" });
-    return sendError(res, "Invalid or missing API key", "authentication_error", 401);
-  }
-
-  if (!rateLimit(clientIp)) {
-    logJsonl({ model: null, status: 429, ip: clientIp, latencyMs: 0, error: "rate_limit" });
-    res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "1" });
-    res.end(JSON.stringify({ error: { message: "Rate limit exceeded", type: "rate_limit_error" } }));
-    return;
-  }
-
-  const { pathname } = new URL(req.url, "http://localhost");
-
-  try {
-    if (req.method === "GET"  && pathname === "/healthz")              return handleHealth(res);
-    if (req.method === "GET"  && pathname === "/v1/models")            return handleModels(res);
-    if (req.method === "POST" && pathname === "/v1/chat/completions")  return handleChatCompletions(req, res);
-    sendError(res, `${req.method} ${pathname} not found`, "not_found_error", 404);
-  } catch (err) {
-    log.error("Unhandled:", err);
-    if (!res.headersSent) sendError(res, err.message, "api_error", 500);
-  }
+const server = createGatewayServer({
+  config, log, rateLimit,
+  sendError: sendErrorOpenAI,
+  routes: [
+    { method: "GET",  path: "/healthz",             handler: makeHealthHandler(config, getToken) },
+    { method: "GET",  path: "/v1/models",           handler: handleModels },
+    { method: "POST", path: "/v1/chat/completions", handler: handleChatCompletions },
+  ],
 });
 
-process.on("uncaughtException",  (e) => log.error("Uncaught exception:",   e));
-process.on("unhandledRejection", (e) => log.error("Unhandled rejection:",  e));
+installProcessGuards(log);
 
 const HOST = process.env.HOST || "127.0.0.1";
 
 server.listen(config.PORT, HOST, () => {
-  console.log(`
-  ┌${"─".repeat(BOX_W + 2)}┐
-  ${boxRow("🛸  AUTOCLAW GATEWAY PROXY (OpenAI Format v2.0.0)")}
-  ├${"─".repeat(BOX_W + 2)}┤
-  ${boxRow(`Host     : ${HOST}`)}
-  ${boxRow(`Port     : ${config.PORT}`)}
-  ${boxRow(`Auth Key : ${config.PROXY_KEY}`)}
-  ${boxRow(`Rate Lim : ${config.RATE_LIMIT} req/s per IP`)}
-  ${boxRow(`Models   : ${MODELS.map(m => m.id).join(", ")}`)}
-  ├${"─".repeat(BOX_W + 2)}┤
-  ${boxRow("OpenCode / OpenAI SDK Base URL:")}
-  ${boxRow(`http://${HOST}:${config.PORT}/v1`)}
-  └${"─".repeat(BOX_W + 2)}┘
-  `);
+  printStartupBanner({
+    title: "🛸  AUTOCLAW GATEWAY PROXY (OpenAI Format v2.0.0)",
+    rows: [
+      `Host     : ${HOST}`,
+      `Port     : ${config.PORT}`,
+      `Auth Key : ${config.PROXY_KEY}`,
+      `Rate Lim : ${config.RATE_LIMIT} req/s per IP`,
+      `Models   : ${MODELS.map(m => m.id).join(", ")}`,
+      "",
+      "OpenCode / OpenAI SDK Base URL:",
+      `http://${HOST}:${config.PORT}/v1`,
+    ],
+  });
 
   try {
     getToken();
