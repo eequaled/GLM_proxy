@@ -20,7 +20,7 @@
   "scripts": {
     "start": "node bin/cli.js",
     "anthropic": "node anthropic.js",
-    "test": "node tests/pen-test-p1.mjs && node tests/pen-test-p2.mjs && node tests/pen-test-p3.mjs && node tests/pen-test-p4.mjs && node tests/pen-test-p5.mjs && node tests/catalog-refresh.mjs"
+    "test": "node tests/pen-test-p1.mjs && node tests/pen-test-p2.mjs && node tests/taxonomy.mjs && node tests/pen-test-p3.mjs && node tests/pen-test-p4.mjs && node tests/pen-test-p5.mjs && node tests/catalog-refresh.mjs"
   },
   "keywords": [
     "autoclaw",
