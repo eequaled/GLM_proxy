@@ -7,8 +7,8 @@ const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 export function startProxy(port, env = {}) {
   return new Promise((resolve, reject) => {
-    const proc = spawn("node", [path.join(ROOT, "main.js")], {
-      env: { ...process.env, PORT: String(port), HOST: "127.0.0.1", PROXY_KEY: "pen-test-key", LOG_LEVEL: "silent", ...env },
+    const proc = spawn("node", [path.join(ROOT, "openai.js")], {
+      env: { ...process.env, PORT: String(port), HOST: "127.0.0.1", PROXY_KEY: "pen-test-key", LOG_LEVEL: "silent", RATE_LIMIT: "200", ...env },
       stdio: "ignore",
       windowsHide: true,
     });

@@ -7,13 +7,18 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 18
-      - run: node --check main.js
+          node-version: ${{ matrix.node-version }}
+      - run: node --check openai.js
       - run: node --check anthropic.js
+      - run: node --check lib/core.js
+      - run: node --check bin/cli.js
       - run: npm test
         env:
           RATE_LIMIT: "200"

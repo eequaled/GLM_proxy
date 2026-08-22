@@ -95,7 +95,7 @@ Without a TTY (piped stdin, CI), the CLI skips the menu and starts the OpenAI fo
 You can still run either proxy directly without the CLI:
 
 ```bash
-node main.js        # OpenAI format, port 18791
+node openai.js      # OpenAI format, port 18791
 node anthropic.js   # Anthropic format, port 18792
 ```
 
