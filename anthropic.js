@@ -1,12 +1,12 @@
 /**
- * AutoClaw Proxy - Anthropic format
+ * AutoClaw Proxy — Anthropic-format entrypoint.
  *
- * Same as openai.js but speaks the Anthropic Messages API instead of OpenAI.
- * Use this with Claude Code CLI or any tool that targets the Anthropic SDK.
- *
- * Usage:
- *   node anthropic.js
- *   PORT=18792 node anthropic.js
+ * Owns ONLY the endpoint surface and wire format:
+ *   POST /v1/messages (+ Anthropic SSE conversion state machine)
+ *   GET  /v1/models (Anthropic list shape), /v1/messages/count_tokens stub
+ * Claude aliases route by AutoClaw CREDIT TIER (opus→High, sonnet→Medium,
+ * haiku→Low) fetched from AutoClaw's remote model-config, degrading to
+ * heuristics when unreachable. Direct AutoClaw model IDs pass through.
  *
  * Claude Code CLI setup (~/.claude/settings.json):
  *   {
@@ -17,86 +17,72 @@
  *   }
  */
 
-import http from "http";
-import path from "path";
-
 import {
-  loadConfig, loadModelCatalog, getModelCatalog,
-  createLogger, createTokenLayer,
-  sendJSON, sendErrorAnthropic, readBody, validateChatPayload, isAuthorized, generateId, collectResponse,
-  createRateLimiter, clientIpAnthropic,
-  createRequestLogger, createJsonlLogger,
+  loadConfig, loadModelCatalog, getModelCatalog, createTokenLayer, createLogger,
+  createRateLimiter, createRequestLogger, createJsonlLogger,
+  makeHealthHandler, createGatewayServer, printStartupBanner, installProcessGuards,
+  sendJSON, sendErrorAnthropic, sendClassifiedErrorAnthropic, resolveClientIp,
+  readBody, validateChatPayload, generateId, collectResponse,
   callUpstreamAnthropic, streamLocalGatewayAgent, getLocalGatewayToken,
-  getUpstreamErrorMessage, translateUpstreamError,
-  BOX_W, boxRow,
+  classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
+  shouldFallbackToLocal, createPermanentFailureCache,
+  fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
 } from "./lib/core.js";
 
-// Pin the request/JSONL logs to Anthropic filenames before loadConfig reads env
-if (!process.env.REQUEST_LOG_FILE) process.env.REQUEST_LOG_FILE = path.join(process.cwd(), "proxy_requests_anthropic.json");
-if (!process.env.JSONL_FILE)       process.env.JSONL_FILE       = path.join(process.cwd(), "proxy_requests_anthropic.jsonl");
-
-// Config
-const config = loadConfig({ defaultPort: 18792 });
-const { PORT, PROXY_KEY, LOG_LEVEL, RATE_LIMIT } = config;
-
-// Logger
-const { log } = createLogger(LOG_LEVEL);
-
-// Model catalog
+// Config (per-format log filenames come from `format`)
+const config = loadConfig({ defaultPort: 18792, format: "anthropic" });
+const { log } = createLogger(config.LOG_LEVEL);
 const { MODELS } = loadModelCatalog(config);
-
-// Resolve model roles dynamically from the loaded catalog
-function findByName(fragment) {
-  return MODELS.find(m => (m.name + " " + m.id).toLowerCase().includes(fragment.toLowerCase()));
-}
-
-function preferredModel(...fragments) {
-  for (const fragment of fragments) {
-    const match = findByName(fragment);
-    if (match) return match.id;
-  }
-  return "zai_auto";
-}
-
-const opusModel   = preferredModel("glm-5.3", "glm-5", "auto");
-const sonnetModel = preferredModel("auto", "glm-5.3", "glm-5");
-const haikuModel  = preferredModel("turbo", "deepseek", "auto");
-
-const CLASS_MAP = [
-  { pattern: /opus/i,   target: opusModel   },
-  { pattern: /sonnet/i, target: sonnetModel },
-  { pattern: /haiku/i,  target: haikuModel  },
-];
-
-const DEFAULT_MODEL = sonnetModel;
-
-// Token layer
 const { getToken, invalidateToken, startWatch } = createTokenLayer(config, log);
-startWatch();
-
-// Request loggers
+const { rateLimit, startBucketSweep } = createRateLimiter(config.RATE_LIMIT);
 const { logRequest } = createRequestLogger(config.REQUEST_LOG_FILE);
-const { logJsonl } = createJsonlLogger({
-  enabled: config.JSONL_LOG, sync: config.JSONL_SYNC, file: config.JSONL_FILE, maxBytes: config.JSONL_MAX_BYTES,
-});
+const { logJsonl } = createJsonlLogger({ enabled: config.JSONL_LOG, sync: config.JSONL_SYNC, file: config.JSONL_FILE, maxBytes: config.JSONL_MAX_BYTES });
 
-// Rate limiter
-const { rateLimit, startBucketSweep } = createRateLimiter(RATE_LIMIT);
+// Remembers models that failed PERMANENTLY (quota exhausted, unknown id) so
+// repeat requests fail instantly instead of replaying doomed attempts.
+const permanentFailures = createPermanentFailureCache();
+
+function invalidateAuth() {
+  invalidateToken();
+  permanentFailures.clear();
+}
+
+startWatch();
 startBucketSweep();
 
-// Anthropic error shape alias
-const sendError = sendErrorAnthropic;
+// ─── Credit-tier routing ────────────────────────────────────────────────────
+// Heuristic tiers apply immediately (startup never blocks on the network);
+// the remote model-config refresh lands in the background and re-computes
+// the targets once it arrives.
 
-// Format conversion (Anthropic <-> OpenAI)
+let tierTargets = resolveTierTargets(annotateCreditTiers(MODELS, null));
 
-// Resolve any Anthropic model name to an AutoClaw model ID.
-function resolveModel(anthropicModel) {
-  const { models } = getModelCatalog(config);
-  if (!anthropicModel) return DEFAULT_MODEL;
-  if (models.some((m) => m.id === anthropicModel)) return anthropicModel;
-  const match = CLASS_MAP.find((c) => c.pattern.test(anthropicModel));
-  return match ? match.target : DEFAULT_MODEL;
+async function refreshTiers() {
+  let jwt = null;
+  try { jwt = getToken(); } catch { return; } // no token yet — heuristics only
+  const remote = await fetchRemoteModelConfig(config, jwt);
+  if (!remote) return;
+  tierTargets = resolveTierTargets(annotateCreditTiers(getModelCatalog(config).models, remote));
+  log.info(`Credit-tier routing: opus→${tierTargets.opus} sonnet→${tierTargets.sonnet} haiku→${tierTargets.haiku} default→${tierTargets.default}`);
 }
+refreshTiers();
+
+// Resolve any Anthropic model name to an AutoClaw model ID:
+// exact catalog IDs pass through untouched; claude-* names map by class.
+function resolveModel(anthropicModel) {
+  if (!anthropicModel) return tierTargets.default;
+  const { models } = getModelCatalog(config);
+  if (models.some((m) => m.id === anthropicModel)) return anthropicModel;
+  const CLASS_MAP = [
+    { pattern: /opus/i,   target: tierTargets.opus },
+    { pattern: /sonnet/i, target: tierTargets.sonnet },
+    { pattern: /haiku/i,  target: tierTargets.haiku },
+  ];
+  const match = CLASS_MAP.find((c) => c.pattern.test(anthropicModel));
+  return match ? match.target : tierTargets.default;
+}
+
+// ─── Format conversion (Anthropic <-> OpenAI) ───────────────────────────────
 
 // Convert an Anthropic Messages request body to OpenAI chat/completions format.
 function anthropicToOpenAI(body, modelId) {
@@ -202,6 +188,11 @@ function anthropicToOpenAI(body, modelId) {
   if (openAIToolChoice)     result.tool_choice = openAIToolChoice;
 
   return result;
+}
+
+// Map an OpenAI finish_reason onto Anthropic stop_reason vocabulary
+function anthropicStopReason(finishReason) {
+  return finishReason === "stop" || !finishReason ? "end_turn" : finishReason;
 }
 
 // Buffer all OpenAI SSE chunks and assemble a single Anthropic response object.
@@ -406,20 +397,9 @@ function fmt(event, data) {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-// Route handlers
+// ─── Routes ─────────────────────────────────────────────────────────────────
 
-function handleHealth(res) {
-  let tokenOk = true, tokenError = null;
-  try   { getToken(); }
-  catch (e) { tokenOk = false; tokenError = e.message; }
-  sendJSON(res, {
-    ok: tokenOk, status: tokenOk ? "live" : "no_token",
-    upstream: config.UPSTREAM_BASE, port: PORT,
-    ...(tokenError ? { error: tokenError } : {}),
-  });
-}
-
-function handleModels(res) {
+function handleModels(req, res) {
   const { models } = getModelCatalog(config);
   const data = models.map((m) => ({
     type:         "model",
@@ -437,275 +417,316 @@ function handleModels(res) {
 
 async function handleMessages(req, res) {
   const startTime = Date.now();
+  const clientIp  = resolveClientIp(req);
+
+  // Model identity isn't known until after conversion — keep these above
+  // record() so validation failures can still log safely (null = unknown).
+  let currentModelId = null;
+  let currentAnthropicModel = null;
+
+  // Exactly one observability entry per request (`via` marks cloud vs local).
+  let recorded = false;
+  function record(status, { lastMessage = null, messageCount = 0, error, via = "cloud" } = {}) {
+    if (recorded) return;
+    recorded = true;
+    logRequest({
+      timestamp: new Date().toISOString(),
+      model: currentModelId, anthropic_model: currentAnthropicModel, status, via,
+      last_message: typeof lastMessage === "string"
+        ? lastMessage.substring(0, 300)
+        : JSON.stringify(lastMessage)?.substring(0, 300) ?? "",
+      ...(messageCount ? { message_count: messageCount } : {}),
+      ...(error ? { error } : {}),
+    });
+    logJsonl({ model: currentModelId, status, ip: clientIp, latencyMs: Date.now() - startTime, ...(via !== "cloud" ? { via } : {}), ...(error ? { error } : {}) });
+  }
+
   let body;
   try {
     body = await readBody(req, config.MAX_BODY_BYTES);
   } catch (err) {
-    const status = err.statusCode || 400;
-    return sendError(res, err.message, "invalid_request", status);
+    record(err.statusCode || 400, { error: "invalid_request" });
+    return sendErrorAnthropic(res, err.message, "invalid_request_error", err.statusCode || 400, "invalid_request");
   }
 
   if (!body.model || typeof body.model !== "string" || body.model.length > 256 || body.model.includes("..") || /[\r\n\0]/.test(body.model)) {
-    return sendError(res, "model must be a valid non-empty string (max 256 chars)", "invalid_request", 400);
+    record(400, { error: "invalid_request" });
+    return sendErrorAnthropic(res, "model must be a valid non-empty string (max 256 chars)", "invalid_request_error", 400, "invalid_model");
   }
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
-    return sendError(res, "messages must be a non-empty array", "invalid_request", 400);
+    record(400, { error: "invalid_request" });
+    return sendErrorAnthropic(res, "messages must be a non-empty array", "invalid_request_error", 400, "invalid_messages");
   }
 
   const modelId    = resolveModel(body.model);
-  const stream     = body.stream === true;
+  const stream     = body.stream === true; // Anthropic defaults to non-streaming
   const openAIBody = anthropicToOpenAI(body, modelId);
   const payloadError = validateChatPayload(openAIBody);
   if (payloadError) {
-    return sendError(res, payloadError.message, "invalid_request", payloadError.statusCode);
+    record(payloadError.statusCode, { error: "payload_too_large" });
+    return sendErrorAnthropic(res, payloadError.message, "invalid_request_error", payloadError.statusCode, "invalid_payload");
   }
 
+  currentModelId = modelId;
+  currentAnthropicModel = body.model;
   log.info(`messages model=${body.model} -> ${modelId} stream=${stream}`);
 
-  let upstreamRes;
-  let upstreamErrBody = "";
+  const lastMsgForLog = () => {
+    const lastMsg = openAIBody.messages?.[openAIBody.messages.length - 1];
+    return typeof lastMsg?.content === "string" ? lastMsg.content : JSON.stringify(lastMsg?.content) ?? "";
+  };
+
+  // Local AutoClaw WebSocket agent fallback (same trigger rules as the OpenAI
+  // entrypoint — this is what gives Anthropic its 402/403/5xx parity).
+  const tryLocalAgent = () => {
+    if (!getLocalGatewayToken()) return Promise.resolve(false);
+    log.info(`Executing chat model=${modelId} via local AutoClaw WebSocket agent...`);
+    return new Promise((resolve) => {
+      let fullContent = "";
+      let streamedStart = false;
+      const startedAt = Date.now();
+
+      streamLocalGatewayAgent({
+        modelId,
+        messages: openAIBody.messages,
+        onChunk: ({ delta }) => {
+          if (stream) {
+            if (!streamedStart) {
+              streamedStart = true;
+              res.writeHead(200, {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+              });
+              res.write(fmt("message_start", {
+                type: "message_start",
+                message: {
+                  id: `msg_${generateId()}`, type: "message", role: "assistant",
+                  model: body.model, content: [], stop_reason: null, stop_sequence: null,
+                  usage: { input_tokens: 0, output_tokens: 0 },
+                },
+              }));
+              res.write(fmt("content_block_start", {
+                type: "content_block_start", index: 0,
+                content_block: { type: "text", text: "" },
+              }));
+            }
+            res.write(fmt("content_block_delta", {
+              type: "content_block_delta", index: 0,
+              delta: { type: "text_delta", text: delta },
+            }));
+          } else {
+            fullContent += delta;
+          }
+        },
+        onEnd: ({ finishReason }) => {
+          if (stream) {
+            res.write(fmt("content_block_stop", { type: "content_block_stop", index: 0 }));
+            res.write(fmt("message_delta", {
+              type: "message_delta",
+              delta: { stop_reason: anthropicStopReason(finishReason), stop_sequence: null },
+              usage: { output_tokens: 0 },
+            }));
+            res.write(fmt("message_stop", { type: "message_stop" }));
+            res.end();
+          } else {
+            sendJSON(res, {
+              id: `msg_${generateId()}`,
+              type: "message",
+              role: "assistant",
+              model: body.model,
+              content: [{ type: "text", text: fullContent }],
+              stop_reason: anthropicStopReason(finishReason),
+              stop_sequence: null,
+              usage: { input_tokens: 0, output_tokens: 0 },
+            });
+          }
+          log.info(`chat model=${modelId} served via local agent (${Date.now() - startedAt}ms)`);
+          record(200, { lastMessage: fullContent, messageCount: openAIBody.messages?.length || 0, via: "local" });
+          resolve(true);
+        },
+        onError: (err) => {
+          log.warn(`Local gateway execution failed: ${err.message}`);
+          const cls = classifyLocalAgentError(err, modelId);
+          permanentFailures.mark(modelId, cls);
+          if (res.headersSent) {
+            // Stream already started — close it rather than throwing a
+            // second writeHead onto a spent response.
+            try { res.end(); } catch (_) {}
+            record(cls.status, { error: `${cls.code} (mid-stream)`, via: "local" });
+          } else {
+            record(cls.status, { error: cls.code, via: "local" });
+            sendClassifiedErrorAnthropic(res, cls);
+          }
+          resolve(true);
+        },
+      });
+    });
+  };
+
   try {
-    upstreamRes = await callUpstreamAnthropic(config.CLIENT_HEADERS, getToken, openAIBody, modelId);
-    // Retry once on transient 400 "invalid request" before trying fallbacks
+    // PREFER_LOCAL=1 fast path — skip doomed cloud attempts entirely.
+    if (config.PREFER_LOCAL && getLocalGatewayToken()) {
+      if (await tryLocalAgent()) return;
+    }
+
+    const cachedFailure = permanentFailures.get(modelId);
+    if (cachedFailure) {
+      log.info(`chat model=${modelId} short-circuited: ${cachedFailure.code} (recently confirmed)`);
+      record(cachedFailure.status, { error: cachedFailure.code });
+      return sendClassifiedErrorAnthropic(res, cachedFailure);
+    }
+
+    let upstreamErrBody = "";
+    let upstreamRes = await callUpstreamAnthropic(config.CLIENT_HEADERS, getToken, openAIBody, modelId);
+
+    // One retry for the historically flaky 400 "invalid request" hiccup —
+    // never for models already confirmed permanently broken.
     if (upstreamRes.statusCode === 400) {
       upstreamErrBody = await collectResponse(upstreamRes);
-      if (upstreamErrBody.includes('"invalid request"')) {
+      if (upstreamErrBody.includes('"invalid request"') && !permanentFailures.get(modelId)) {
         log.info("Upstream 400 invalid request — retrying once");
         await new Promise(r => setTimeout(r, 2000));
         upstreamRes = await callUpstreamAnthropic(config.CLIENT_HEADERS, getToken, openAIBody, modelId);
-        if (upstreamRes.statusCode >= 200 && upstreamRes.statusCode < 400) {
-          upstreamErrBody = "";
-        } else {
-          upstreamErrBody = await collectResponse(upstreamRes);
-        }
+        if (upstreamRes.statusCode >= 400) upstreamErrBody = await collectResponse(upstreamRes);
+        else upstreamErrBody = "";
       }
     } else if (upstreamRes.statusCode === 401) {
       upstreamErrBody = await collectResponse(upstreamRes);
     }
 
-    if ((upstreamRes.statusCode === 400 || upstreamRes.statusCode === 401) && upstreamErrBody) {
-      if (getLocalGatewayToken()) {
-        log.info(`Anthropic upstream ${upstreamRes.statusCode} — executing via local AutoClaw WebSocket agent...`);
-        return new Promise((resolve) => {
-          let fullContent = "";
-          let streamedStart = false;
+    const statusCode = upstreamRes.statusCode;
 
-          streamLocalGatewayAgent({
-            modelId,
-            messages: openAIBody.messages,
-            onChunk: ({ delta }) => {
-              if (stream) {
-                if (!streamedStart) {
-                  streamedStart = true;
-                  res.writeHead(200, {
-                    "Content-Type": "text/event-stream",
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                  });
-                  res.write(fmt("message_start", {
-                    type: "message_start",
-                    message: {
-                      id: `msg_${generateId()}`, type: "message", role: "assistant",
-                      model: body.model, content: [], stop_reason: null, stop_sequence: null,
-                      usage: { input_tokens: 0, output_tokens: 0 },
-                    },
-                  }));
-                  res.write(fmt("content_block_start", {
-                    type: "content_block_start", index: 0,
-                    content_block: { type: "text", text: "" },
-                  }));
-                }
-                res.write(fmt("content_block_delta", {
-                  type: "content_block_delta", index: 0,
-                  delta: { type: "text_delta", text: delta },
-                }));
-              } else {
-                fullContent += delta;
-              }
-            },
-            onEnd: ({ finishReason }) => {
-              if (stream) {
-                res.write(fmt("content_block_stop", { type: "content_block_stop", index: 0 }));
-                res.write(fmt("message_delta", {
-                  type: "message_delta",
-                  delta: { stop_reason: finishReason === "stop" ? "end_turn" : finishReason, stop_sequence: null },
-                  usage: { output_tokens: 0 },
-                }));
-                res.write(fmt("message_stop", { type: "message_stop" }));
-                res.end();
-                resolve();
-              } else {
-                sendJSON(res, {
-                  id: `msg_${generateId()}`,
-                  type: "message",
-                  role: "assistant",
-                  model: body.model,
-                  content: [{ type: "text", text: fullContent }],
-                  stop_reason: finishReason === "stop" ? "end_turn" : finishReason,
-                  stop_sequence: null,
-                  usage: { input_tokens: 0, output_tokens: 0 },
-                });
-                resolve();
-              }
-            },
-            onError: (err) => {
-              log.warn(`Local gateway execution failed: ${err.message}`);
-              sendError(res, getUpstreamErrorMessage(upstreamErrBody || err.message), "api_error", upstreamRes.statusCode);
-              resolve();
-            }
-          });
-        });
+    // Rotate token caches BEFORE deciding fallback so the very next request
+    // picks up the fresh JWT regardless of who serves this one.
+    if (statusCode === 401) invalidateAuth();
+
+    if (shouldFallbackToLocal(statusCode)) {
+      const cls = classifyUpstreamError(statusCode, upstreamErrBody, modelId);
+      if (cls.permanent) permanentFailures.mark(modelId, cls);
+      log.error(`Upstream error ${statusCode}:`, cls.message);
+
+      // The desktop gateway shares this AutoClaw account — quota walls stop
+      // it too, so don't march known-permanent failures into it.
+      if (!cls.permanent || !permanentFailures.get(modelId)) {
+        if (await tryLocalAgent()) return;
+      } else {
+        log.info(`Skipping local fallback for ${modelId}: ${cls.code} is account-wide`);
       }
+
+      record(cls.status, { lastMessage: lastMsgForLog(), messageCount: openAIBody.messages?.length || 0, error: cls.code });
+      return sendClassifiedErrorAnthropic(res, cls);
     }
-  } catch (err) {
-    const status = err.message.includes("Cannot read AutoClaw token") ? 503 : 502;
-    logJsonl({ model: modelId, status, ip: clientIpAnthropic(req), latencyMs: Date.now() - startTime, error: "upstream_error" });
-    return sendError(res, translateUpstreamError(err.message), "api_error", status);
-  }
 
-  log.debug(`upstream status=${upstreamRes.statusCode}`);
+    // Success paths
+    record(statusCode, { lastMessage: lastMsgForLog(), messageCount: openAIBody.messages?.length || 0 });
 
-  const lastMsg = openAIBody.messages?.[openAIBody.messages.length - 1];
-  logRequest({
-    timestamp: new Date().toISOString(),
-    model: modelId,
-    anthropic_model: body.model,
-    status: upstreamRes.statusCode,
-    last_message: typeof lastMsg?.content === "string"
-      ? lastMsg.content.substring(0, 300)
-      : JSON.stringify(lastMsg?.content).substring(0, 300),
-    message_count: openAIBody.messages?.length || 0,
-  });
+    if (stream) {
+      res.writeHead(200, {
+        "Content-Type":      "text/event-stream",
+        "Cache-Control":     "no-cache",
+        "Connection":        "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
 
-  logJsonl({ model: modelId, status: upstreamRes.statusCode, ip: clientIpAnthropic(req), latencyMs: Date.now() - startTime });
+      res.write(fmt("message_start", {
+        type:    "message_start",
+        message: {
+          id: `msg_${generateId()}`, type: "message", role: "assistant",
+          model: modelId, content: [], stop_reason: null, stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      }));
+      res.write(fmt("ping", { type: "ping" }));
 
-  if (upstreamRes.statusCode === 401) {
-    invalidateToken();
-    return sendError(res, "AutoClaw token expired - invalidated cache, retry the request", "authentication_error", 401);
-  }
+      const state = {
+        blockIndex: 0, blockOpen: false,
+        thinkingOpen: false, textOpen: false,
+        outputTokens: 0, finishReason: "end_turn",
+        toolState: {},
+      };
 
-  if (upstreamRes.statusCode >= 400) {
-    const errBody = upstreamErrBody || await collectResponse(upstreamRes);
-    const message = getUpstreamErrorMessage(errBody);
-    log.error(`Upstream error ${upstreamRes.statusCode}:`, message);
-    sendError(res, message, "api_error", upstreamRes.statusCode);
-    return;
-  }
+      let buffer = "";
+      upstreamRes.on("data", (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+        for (const line of lines) {
+          for (const e of openAIChunkToAnthropicEvents(line.trim(), state)) res.write(e);
+        }
+      });
 
-  if (stream) {
-    res.writeHead(200, {
-      "Content-Type":      "text/event-stream",
-      "Cache-Control":     "no-cache",
-      "Connection":        "keep-alive",
-      "X-Accel-Buffering": "no",
-    });
+      upstreamRes.on("end", () => {
+        if (buffer.trim()) {
+          for (const e of openAIChunkToAnthropicEvents(buffer.trim(), state)) res.write(e);
+        }
+        for (const e of openAIChunkToAnthropicEvents("data: [DONE]", state)) res.write(e);
+        res.end();
+      });
 
-    res.write(fmt("message_start", {
-      type:    "message_start",
-      message: {
-        id: `msg_${generateId()}`, type: "message", role: "assistant",
-        model: modelId, content: [], stop_reason: null, stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0 },
-      },
-    }));
-    res.write(fmt("ping", { type: "ping" }));
+      upstreamRes.on("error", (err) => { log.error("Stream error:", err); res.end(); });
+      return;
+    }
 
-    const state = {
-      blockIndex: 0, blockOpen: false,
-      thinkingOpen: false, textOpen: false,
-      outputTokens: 0, finishReason: "end_turn",
-      toolState: {},
-    };
-
-    let buffer = "";
-    upstreamRes.on("data", (chunk) => {
-      buffer += chunk.toString();
-      const lines = buffer.split("\n");
-      buffer = lines.pop();
-      for (const line of lines) {
-        for (const e of openAIChunkToAnthropicEvents(line.trim(), state)) res.write(e);
-      }
-    });
-
-    upstreamRes.on("end", () => {
-      if (buffer.trim()) {
-        for (const e of openAIChunkToAnthropicEvents(buffer.trim(), state)) res.write(e);
-      }
-      for (const e of openAIChunkToAnthropicEvents("data: [DONE]", state)) res.write(e);
-      res.end();
-    });
-
-    upstreamRes.on("error", (err) => { log.error("Stream error:", err); res.end(); });
-
-  } else {
+    // Non-stream: buffer everything into one Anthropic response object.
     let raw = "";
     upstreamRes.on("data", (c) => (raw += c));
-    upstreamRes.on("end",  () => {
+    upstreamRes.on("end", () => {
       try {
-        const inputTokens = (body.messages?.length ?? 1) * 10;
+        const inputTokens = (body.messages?.length ?? 1) * 10; // rough estimate only
         sendJSON(res, openAIChunksToAnthropic(raw, modelId, inputTokens));
       } catch (err) {
-        sendError(res, `Failed to parse upstream response: ${err.message}`, "api_error", 502);
+        if (!res.headersSent) sendErrorAnthropic(res, `Failed to parse upstream response: ${err.message}`, "api_error", 502, "upstream_parse_failed");
+        else { try { res.end(); } catch (_) {} }
       }
     });
+  } catch (err) {
+    const cls = classifyTransportError(err);
+    log.error(`messages model=${body.model} transport failure:`, cls.message);
+    if (!res.headersSent && shouldFallbackToLocal(cls.status)) {
+      if (await tryLocalAgent()) return;
+    }
+    if (res.headersSent) { try { res.end(); } catch (_) {} return; }
+    record(cls.status, { lastMessage: lastMsgForLog(), messageCount: openAIBody.messages?.length || 0, error: cls.code });
+    return sendClassifiedErrorAnthropic(res, cls);
   }
 }
 
 // Server
 
-const server = http.createServer(async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin",  "*");
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, Anthropic-Version, Anthropic-Beta");
-
-  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
-
-  if (!rateLimit(clientIpAnthropic(req))) {
-    res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "1" });
-    res.end(JSON.stringify({ error: { message: "Rate limit exceeded", type: "rate_limit_error" } }));
-    return;
-  }
-
-  if (!isAuthorized(req, PROXY_KEY)) {
-    return sendError(res, "Invalid or missing API key", "authentication_error", 401);
-  }
-
-  const { pathname } = new URL(req.url, "http://localhost");
-
-  try {
-    if (req.method === "GET"  && pathname === "/healthz")              return handleHealth(res);
-    if (req.method === "GET"  && pathname === "/v1/models")            return handleModels(res);
-    if (req.method === "POST" && pathname === "/v1/messages")         return handleMessages(req, res);
-    if (pathname === "/v1/messages/count_tokens")                     return sendJSON(res, { input_tokens: 0 });
-    sendError(res, `${req.method} ${pathname} not found`, "not_found_error", 404);
-  } catch (err) {
-    log.error("Unhandled:", err);
-    if (!res.headersSent) sendError(res, err.message, "api_error", 500);
-  }
+const server = createGatewayServer({
+  config, log, rateLimit,
+  sendError: sendErrorAnthropic,
+  routes: [
+    { method: "GET",  path: "/healthz",                     handler: makeHealthHandler(config, getToken) },
+    { method: "GET",  path: "/v1/models",                   handler: handleModels },
+    { method: "POST", path: "/v1/messages",                 handler: handleMessages },
+    // Claude Code probes token counts pre-flight; we don't tokenize locally,
+    // so report zero rather than 404-ing the whole session handshake.
+    { path: "/v1/messages/count_tokens", handler: (req, res) => sendJSON(res, { input_tokens: 0 }) },
+  ],
 });
 
-process.on("uncaughtException",  (e) => log.error("Uncaught exception:",  e));
-process.on("unhandledRejection", (e) => log.error("Unhandled rejection:", e));
+installProcessGuards(log);
 
 const HOST = process.env.HOST || "127.0.0.1";
 
-server.listen(PORT, HOST, () => {
-  console.log(`
-  ┌${"─".repeat(BOX_W + 2)}┐
-  ${boxRow("🛸  AUTOCLAW GATEWAY PROXY (Anthropic Format v2.0.0)")}
-  ├${"─".repeat(BOX_W + 2)}┤
-  ${boxRow(`Host     : ${HOST}`)}
-  ${boxRow(`Port     : ${PORT}`)}
-  ${boxRow(`Auth Key : ${PROXY_KEY}`)}
-  ${boxRow(`Rate Lim : ${RATE_LIMIT} req/s per IP`)}
-  ${boxRow(`Models   : ${MODELS.map(m => m.id).join(", ")}`)}
-  ├${"─".repeat(BOX_W + 2)}┤
-  ${boxRow("Claude Code CLI Base URL:")}
-  ${boxRow(`http://${HOST}:${PORT}`)}
-  └${"─".repeat(BOX_W + 2)}┘
-  `);
+server.listen(config.PORT, HOST, () => {
+  printStartupBanner({
+    title: "🛸  AUTOCLAW GATEWAY PROXY (Anthropic Format v2.0.0)",
+    rows: [
+      `Host     : ${HOST}`,
+      `Port     : ${config.PORT}`,
+      `Auth Key : ${config.PROXY_KEY}`,
+      `Rate Lim : ${config.RATE_LIMIT} req/s per IP`,
+      `Models   : ${MODELS.map(m => m.id).join(", ")}`,
+      "",
+      "Claude Code CLI Base URL:",
+      `http://${HOST}:${config.PORT}`,
+      `Routing  : opus→${tierTargets.opus} sonnet→${tierTargets.sonnet} haiku→${tierTargets.haiku}`,
+    ],
+  });
 
   try {
     getToken();
