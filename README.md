@@ -110,6 +110,7 @@ They read the same env vars and respect `HOST`, `PORT`, `PROXY_KEY`, `RATE_LIMIT
 | `PROXY_KEY` / `--key` | `mewmew` | API key clients must send |
 | `RATE_LIMIT` / `--rate-limit` | `30` | Max requests per second per client IP |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `silent` |
+| `PREFER_LOCAL` | off | Set to `1` to use the local AutoClaw gateway first, skipping cloud attempts |
 | `MAX_BODY_BYTES` | `52428800` | Max request body (50 MB) |
 | `JSONL_LOG` | off | Write structured JSONL request log when `true` |
 | `JSONL_FILE` | `proxy_requests.jsonl` (Anthropic: `proxy_requests_anthropic.jsonl`) | JSONL output path |
@@ -131,13 +132,13 @@ The Anthropic variant writes to `proxy_requests_anthropic.jsonl`.
 
 ### Model doctor
 
-Run the doctor command whenever AutoClaw updates to scan its live runtime catalog and show the routing targets the proxy will use:
+Run the doctor to scan AutoClaw's live model catalog with **credit tiers** fetched from its remote model-config (falling back to the runtime file, then built-ins), and print the Claude alias routing map computed by the same resolver the Anthropic proxy uses:
 
 ```bash
 node bin/cli.js --doctor
 ```
 
-It reads AutoClaw's `openclaw.runtime.json` directly and falls back to the gateway's bundled catalog only if that runtime file is unavailable.
+Anthropic routing follows credit tiers: opus → High, sonnet → Medium, haiku → Low. UI display names can differ from API ids (the API's `zaicoding_glm-5.3` shows as "GLM-5.2" in AutoClaw's UI).
 
 ## API
 
@@ -178,6 +179,27 @@ Anthropic-compatible Messages API. Supports both streaming and non-streaming. Cl
 | `claude-sonnet-*` | `zai_auto` (or next available GLM-5 model) |
 | `claude-haiku-*` | `zai_glm-5-turbo` (or DeepSeek / Auto fallback) |
 
+## Error handling
+
+Every failure maps to a semantically correct status with a machine-readable `code` — no more generic blobs:
+
+| Situation | HTTP | `code` |
+|-----------|------|--------|
+| Bad client input (bad JSON / oversized / wrong Content-Type) | `400` / `413` / `415` | `invalid_request` |
+| Model out of credits or free quota (upstream 402/403/810000) | `402` | `quota_exhausted` |
+| AutoClaw token expired | `401` | `token_expired` |
+| Model unknown upstream | `404` | `model_not_found` |
+| Upstream rate limit | `429` | `rate_limited_by_upstream` |
+| Upstream returned garbage or died | `502` | `upstream_failure` |
+| AutoClaw not running (no token file) | `503` | `no_token` |
+| Upstream timeout (2 min) | `504` | `upstream_timeout` |
+
+Quota errors are remembered for 60s per model: repeat requests fail instantly instead of replaying doomed cloud + fallback attempts.
+
+## Local gateway fallback
+
+When the cloud upstream fails (and it's not a plain 404/429), the proxy re-runs your prompt through **AutoClaw's own desktop agent** over a local WebSocket (`127.0.0.1:18789`). Responses served this way are logged with `via: "local"` in the JSONL log. Caveats: it's a full agentic run (slower, tools included), and it shares your account's credits — quota walls stop it too. Set `PREFER_LOCAL=1` to skip the cloud attempt entirely while credits are exhausted.
+
 ## Models
 
 | ID | Name | Context | Max Output | Notes |
@@ -185,7 +207,8 @@ Anthropic-compatible Messages API. Supports both streaming and non-streaming. Cl
 | `zai_auto` | Auto | 1M | 393K | Routes to AutoClaw's optimal model |
 | `zaicoding_glm-5.3` | GLM-5.3 | 1M | 307K | Latest GLM coding model |
 | `zai_glm-5-turbo` | GLM-5-Turbo | 200K | 131K | Zhipu AI GLM-5 Turbo |
-| `tdpsk_deepseek-v4-flash-202605` | Deepseek-V4-Flash | 1M | 131K | Fast DeepSeek model |
+| `tdpsk_deepseek-v4-flash-202605` | Deepseek-V4-Flash | 1M | 393K | Fast DeepSeek model |
+| `tdpsk_deepseek-v4-pro-202606` | DeepSeek-V4-Pro | 1M | 393K | Deep reasoning model |
 
 > GLM 5.3 new in the proxy? Maybe. Supposedly in the UI it's 5.2 but in the API it's 5.3. We'll never know, but it's a win-win xd.
 
@@ -289,9 +312,10 @@ Any tool that supports OpenAI-compatible providers works. Point it at `http://lo
 - Only one AutoClaw account can be active at a time — multi-account pooling isn't supported
 - `PROXY_KEY` is just a local password for this proxy, not your AutoClaw credentials — set it to whatever you want
 - On a 401, the proxy invalidates its cached token and you can retry immediately
-- On a 400 "invalid request" from upstream, the proxy retries once after a 2s delay before surfacing the error
+- Upstream 400 "invalid request" gets one retry after a 2s delay (a known upstream hiccup); quota/plan errors are never retried
+- When cloud fails, requests fall back to AutoClaw's local desktop agent (`via: "local"` in logs) unless the model just failed permanently there too
 - The token file is watched for changes — AutoClaw can rotate auth mid-session without a restart
-- Rate limit is enforced per client IP (default 30 req/s)
+- Rate limit is enforced per client IP (default 30 req/s); X-Forwarded-For is only honored from `TRUSTED_PROXIES`
 - No dependencies at all: the interactive menu is hand-rolled on Node's built-in `readline`, so there's zero `node_modules` and zero install step
 
 ## Special Thanks
