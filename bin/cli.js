@@ -4,7 +4,11 @@ import path from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { promptSelect, promptInput, promptNumber } from "../lib/prompts.js";
 import http from "http";
-import { getModelCatalog, loadConfig, createTokenLayer, callUpstreamOpenAI, getLocalGatewayToken, COLORS } from "../lib/core.js";
+import {
+  getModelCatalog, loadConfig, createTokenLayer,
+  fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
+  getLocalGatewayToken, COLORS,
+} from "../lib/core.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -26,9 +30,13 @@ function showHelp() {
     --host <ip>       Host to bind (default: 127.0.0.1)
     --key <string>    Authentication key for clients (default: mewmew)
     --rate-limit <n>  Max requests per second per IP (default: 30)
-    --doctor          Scan AutoClaw's live model catalog and print routing targets
+    --doctor          Live credit-tier scan of AutoClaw's catalog + routing map
     --test-models     Test all configured models against upstream and show live health
     --help, -h        Show this help message
+
+  Environment:
+    PREFER_LOCAL=1    Skip cloud attempts when the local AutoClaw gateway is up
+    TRUSTED_PROXIES   Comma-separated IPs whose X-Forwarded-For header is trusted
   `);
   process.exit(0);
 }
@@ -41,15 +49,24 @@ async function runModelTests() {
   console.log(`  ───────────────────────────────────────────`);
 
   // Spin up a temporary proxy on a test port so requests go through
-  // the full pipeline (cloud upstream → local gateway fallback)
+  // the full pipeline (cloud upstream → local gateway fallback).
   const testPort = 19799;
   const testKey = "model-test-" + Date.now();
+
+  // Isolated log files: without these, the spawned child's read-modify-write
+  // on the shared ring log clobbers entries written by your running proxies
+  // (observed: whole batches of results vanishing mid-run).
+  const testEnvLog = path.join(process.cwd(), "proxy_requests_test.json");
+  const testEnvJsonl = path.join(process.cwd(), "proxy_requests_test.jsonl");
+
   const env = {
     ...process.env,
     PORT: String(testPort),
     HOST: "127.0.0.1",
     PROXY_KEY: testKey,
     LOG_LEVEL: "silent",
+    REQUEST_LOG_FILE: testEnvLog,
+    JSONL_FILE: testEnvJsonl,
   };
 
   const { spawn } = await import("child_process");
@@ -81,7 +98,11 @@ async function runModelTests() {
   }
 
   const localToken = getLocalGatewayToken();
-  console.log(`  Local gateway: ${localToken ? `${COLORS.BLUE}available${COLORS.RESET}` : `${COLORS.GRAY}not found${COLORS.RESET}`}\n`);
+  console.log(`  Local gateway: ${localToken ? `${COLORS.BLUE}available${COLORS.RESET}` : `${COLORS.GRAY}not found${COLORS.RESET}`}`);
+
+  // Fallback-served requests are invisible in terminal output otherwise —
+  // point the operator at the isolated log for per-request attribution.
+  console.log(`  Request log  : ${path.basename(testEnvLog)}\n`);
 
   for (const model of catalog.models) {
     process.stdout.write(`  Testing ${COLORS.CYAN}${model.name}${COLORS.RESET} (${model.id})... `);
@@ -119,11 +140,22 @@ async function runModelTests() {
       const elapsed = Date.now() - startTime;
       if (result.status === 200) {
         let answer = "";
-        try { answer = JSON.parse(result.body).choices?.[0]?.message?.content || ""; } catch {}
+        let servedBy = "";
+        try {
+          const parsed = JSON.parse(result.body);
+          answer = parsed.choices?.[0]?.message?.content || "";
+          // Attribution: responses assembled by the local-agent fallback carry
+          // zero usage counters — cloud answers report real token usage.
+          servedBy = parsed.usage?.prompt_tokens === 0 && parsed.usage?.completion_tokens === 0
+            ? ` ${COLORS.MAGENTA}[via local agent]${COLORS.RESET}`
+            : "";
+        } catch {}
         const preview = answer.length > 40 ? answer.slice(0, 40) + "…" : answer;
-        console.log(`${COLORS.BLUE}✔ working${COLORS.RESET} ${COLORS.GRAY}(${elapsed}ms)${COLORS.RESET} → ${COLORS.GRAY}${preview}${COLORS.RESET}`);
+        console.log(`${COLORS.BLUE}✔ working${COLORS.RESET}${servedBy} ${COLORS.GRAY}(${elapsed}ms) → ${preview}${COLORS.RESET}`);
       } else {
-        console.log(`${COLORS.RED}✗ failed (${result.status})${COLORS.RESET} ${COLORS.GRAY}(${elapsed}ms)${COLORS.RESET}`);
+        let detail = "";
+        try { detail = JSON.parse(result.body).error?.message || ""; } catch {}
+        console.log(`${COLORS.RED}✗ failed (${result.status})${COLORS.RESET} ${COLORS.GRAY}(${elapsed}ms)${detail ? ` → ${detail}` : ""}`);
       }
     } catch (err) {
       const elapsed = Date.now() - startTime;
@@ -136,27 +168,55 @@ async function runModelTests() {
   await new Promise((r) => setTimeout(r, 300));
 }
 
-function runDoctor() {
-  const catalog = getModelCatalog(loadConfig({ defaultPort: 18791 }));
-  console.log(`\n  AutoClaw model doctor\n  ───────────────────────────────────────────`);
-  console.log(`  Source: ${catalog.source || "built-in fallback"}`);
-  console.log(`  Status: ${catalog.fallback ? "runtime catalog unavailable" : "runtime catalog loaded"}\n`);
-  catalog.models.forEach((model, index) => {
+// Live credit-tier doctor: remote model-config → runtime catalog → built-in
+// fallback, routed through the SAME annotate/resolve pair the Anthropic
+// entrypoint uses. No duplicated fragment matching here anymore.
+async function runDoctor() {
+  const config = loadConfig({ defaultPort: 18791 });
+  const catalog = getModelCatalog(config);
+
+  console.log(`\n  AutoClaw model doctor`);
+  console.log(`  ───────────────────────────────────────────`);
+
+  let source = catalog.source ? path.basename(catalog.source) : "built-in fallback";
+  let status = catalog.fallback ? "runtime catalog unavailable" : "runtime catalog loaded";
+
+  // Read the JWT straight from AutoClaw's token file (silent — the doctor
+  // must work even while the desktop app is closed).
+  let jwt = null;
+  try {
+    const tokenLayer = createTokenLayer(config, { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, success: () => {} });
+    jwt = tokenLayer.loadToken();
+  } catch (_) {}
+
+  const remoteModels = await fetchRemoteModelConfig(config, jwt);
+  if (remoteModels) {
+    source = "remote model-config";
+    status = `live credit-tier data (${remoteModels.length} models)`;
+  } else if (jwt) {
+    status += " · remote fetch failed — heuristic tiers apply";
+  } else {
+    status += " · no AutoClaw token — heuristic tiers apply";
+  }
+
+  const models = annotateCreditTiers(catalog.models, remoteModels);
+  const targets = resolveTierTargets(models);
+
+  console.log(`  Source: ${source}`);
+  console.log(`  Status: ${status}\n`);
+
+  models.forEach((model, index) => {
     const context = model.contextWindow ? `${Math.round(model.contextWindow / 1024)}K context` : "context unknown";
     const output = model.maxTokens ? `${Math.round(model.maxTokens / 1024)}K max output` : "output unknown";
-    console.log(`  ${index + 1}. ${model.name} (${model.id}) — ${context}, ${output}`);
+    const tier = model.creditLevel ? `${model.creditLevel} credit` : "tier unknown";
+    console.log(`  ${index + 1}. ${model.name} (${model.id}) — ${tier}, ${context}, ${output}`);
   });
-  const findModel = (...fragments) => {
-    for (const fragment of fragments) {
-      const match = catalog.models.find((model) => `${model.name} ${model.id}`.toLowerCase().includes(fragment));
-      if (match) return match.id;
-    }
-    return "zai_auto";
-  };
-  console.log(`\n  Anthropic routing:`);
-  console.log(`  claude-opus-*   → ${findModel("glm-5.3", "glm-5")}`);
-  console.log(`  claude-sonnet-* → ${findModel("auto", "glm-5.3", "glm-5")}`);
-  console.log(`  claude-haiku-*  → ${findModel("turbo", "deepseek", "auto")}\n`);
+
+  console.log(`\n  Claude alias routing (by credit tier):`);
+  console.log(`  claude-opus-*   → ${targets.opus ?? "?"}`);
+  console.log(`  claude-sonnet-* → ${targets.sonnet ?? "?"}`);
+  console.log(`  claude-haiku-*  → ${targets.haiku ?? "?"}`);
+  console.log(`  unknown model   → ${targets.default ?? "?"}\n`);
 }
 
 if (args.includes("--help") || args.includes("-h")) {
@@ -169,7 +229,7 @@ if (args.includes("--test-models") || args.includes("--test")) {
 }
 
 if (args.includes("--doctor")) {
-  runDoctor();
+  await runDoctor();
   process.exit(0);
 }
 
@@ -211,7 +271,7 @@ if (!hasFlags && process.stdin.isTTY) {
     });
 
     if (action === "doctor") {
-      runDoctor();
+      await runDoctor();
       const next = await promptSelect({
         message: "Next action:",
         choices: [
