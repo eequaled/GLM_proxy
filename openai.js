@@ -27,7 +27,9 @@ import {
   createRateLimiter, createRequestLogger, createJsonlLogger,
   makeHealthHandler, createGatewayServer, printStartupBanner, installProcessGuards,
   sendJSON, sendErrorOpenAI, sendClassifiedErrorOpenAI, resolveClientIp,
-  readBody, validateChatPayload, generateId, collectResponse,
+  readBody, validateChatPayload, generateId,
+  SSE_HEADERS, validateModelField, lastMessagePreview,
+  logUpstreamErrorBody, callUpstreamWithInvalidRequestRetry,
   callUpstreamOpenAI, streamLocalGatewayAgent, getLocalGatewayToken,
   classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
   shouldFallbackToLocal, createPermanentFailureCache,
@@ -177,13 +179,7 @@ async function handleChatCompletions(req, res) {
   }
 
   // R1: never let an upstream rejection pass without its body on record —
-  // last night's quota walls hid behind bare status codes. Single compact
-  // line, whitespace-collapsed, capped at 500 chars.
-  function logUpstreamErrorBody(logger, status, bodyText) {
-    const text = typeof bodyText === "string" ? bodyText.replace(/\s+/g, " ").trim() : "";
-    if (!text) return;
-    logger.warn(`Upstream ${status} body: ${text.slice(0, 500)}`);
-  }
+  // (logUpstreamErrorBody lives in lib/core.js — shared with anthropic.js)
 
   let body;
   try {
@@ -194,9 +190,10 @@ async function handleChatCompletions(req, res) {
   }
 
   // Input validation — model field first (it drives everything downstream)
-  if (!body.model || typeof body.model !== "string" || body.model.length > 256 || body.model.includes("..") || /[\r\n\0]/.test(body.model)) {
+  const modelFieldError = validateModelField(body);
+  if (modelFieldError) {
     record(400, { error: "invalid_request" });
-    return sendErrorOpenAI(res, "model must be a valid non-empty string (max 256 chars)", "invalid_request_error", 400, "invalid_model");
+    return sendErrorOpenAI(res, modelFieldError.message, modelFieldError.type, modelFieldError.status, modelFieldError.code);
   }
   const payloadError = validateChatPayload(body);
   if (payloadError) {
@@ -211,10 +208,7 @@ async function handleChatCompletions(req, res) {
 
   log.info(`chat model=${modelId} stream=${stream}`);
 
-  const lastMsgForLog = () => {
-    const lastMsg = body.messages?.[body.messages.length - 1];
-    return typeof lastMsg?.content === "string" ? lastMsg.content : JSON.stringify(lastMsg?.content) ?? "";
-  };
+  const lastMsgForLog = () => lastMessagePreview(body.messages);
 
   // Cloud-attempt evidence (status + classifier code) set when the cloud
   // rejected this request before fallback ran; consumed by record() so the
@@ -239,12 +233,7 @@ async function handleChatCompletions(req, res) {
           if (stream) {
             if (!streamedHeader) {
               streamedHeader = true;
-              res.writeHead(200, {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-              });
+              res.writeHead(200, SSE_HEADERS);
             }
             const chunk = JSON.stringify({
               id: `chatcmpl-${generateId()}`,
@@ -313,12 +302,7 @@ async function handleChatCompletions(req, res) {
     log.debug(`← upstream status=${successRes.statusCode}`);
 
     if (stream) {
-      res.writeHead(200, {
-        "Content-Type":    "text/event-stream",
-        "Cache-Control":   "no-cache",
-        "Connection":      "keep-alive",
-        "X-Accel-Buffering": "no",
-      });
+      res.writeHead(200, SSE_HEADERS);
       successRes.pipe(res);
       return;
     }
@@ -347,32 +331,16 @@ async function handleChatCompletions(req, res) {
       return sendClassifiedErrorOpenAI(res, cachedFailure);
     }
 
-    let upstreamErrBody = "";
-    let upstreamRes = await callUpstreamOpenAI(knownIds, config.CLIENT_HEADERS, getToken, body, modelId, log);
-    const statusCode  = upstreamRes.statusCode;
-
-    // One retry for the historically flaky 400 "invalid request" hiccup —
-    // but never for a model we've already confirmed permanently broken.
-    if (statusCode === 400) {
-      upstreamErrBody = await collectResponse(upstreamRes);
-      logUpstreamErrorBody(log, statusCode, upstreamErrBody);
-      if (upstreamErrBody.includes('"invalid request"') && !permanentFailures.get(modelId)) {
-        log.info("Upstream 400 invalid request — retrying once");
-        await new Promise(r => setTimeout(r, 2000));
-        const retried = await callUpstreamOpenAI(knownIds, config.CLIENT_HEADERS, getToken, body, modelId, log);
-        if (retried.statusCode < 400) {
-          return respondSuccess(retried);
-        }
-        upstreamRes = retried;
-        upstreamErrBody = await collectResponse(retried);
-        logUpstreamErrorBody(log, retried.statusCode, upstreamErrBody);
-      }
-    } else if (statusCode >= 400) {
-      upstreamErrBody = await collectResponse(upstreamRes);
-      logUpstreamErrorBody(log, statusCode, upstreamErrBody);
-    }
+    // Cloud call with one retry on the flaky 400 "invalid request" hiccup;
+    // every >=400 body is buffered + logged (R1). Shared with anthropic.js.
+    const { res: upstreamRes, errBody: upstreamErrBody } = await callUpstreamWithInvalidRequestRetry(
+      () => callUpstreamOpenAI(knownIds, config.CLIENT_HEADERS, getToken, body, modelId, log),
+      modelId, permanentFailures, log,
+    );
 
     const effectiveStatus = upstreamRes.statusCode;
+
+    if (effectiveStatus < 400) return respondSuccess(upstreamRes);
 
     // Rotate-out token caches BEFORE deciding fallback so the very next
     // request picks up the fresh JWT regardless of who serves this one.

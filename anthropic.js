@@ -22,7 +22,9 @@ import {
   createRateLimiter, createRequestLogger, createJsonlLogger,
   makeHealthHandler, createGatewayServer, printStartupBanner, installProcessGuards,
   sendJSON, sendErrorAnthropic, sendClassifiedErrorAnthropic, resolveClientIp,
-  readBody, validateChatPayload, generateId, collectResponse,
+  readBody, validateChatPayload, generateId,
+  SSE_HEADERS, validateModelField, lastMessagePreview,
+  logUpstreamErrorBody, callUpstreamWithInvalidRequestRetry,
   callUpstreamAnthropic, streamLocalGatewayAgent, getLocalGatewayToken,
   classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
   shouldFallbackToLocal, createPermanentFailureCache,
@@ -442,13 +444,7 @@ async function handleMessages(req, res) {
     logJsonl({ model: currentModelId, status, ip: clientIp, latencyMs: Date.now() - startTime, ...(via !== "cloud" ? { via } : {}), ...(error ? { error } : {}) });
   }
 
-  // R1: never let an upstream rejection pass without its body on record —
-  // quota walls hide behind bare status codes. One compact line, capped.
-  function logUpstreamErrorBody(logger, status, bodyText) {
-    const text = typeof bodyText === "string" ? bodyText.replace(/\s+/g, " ").trim() : "";
-    if (!text) return;
-    logger.warn(`Upstream ${status} body: ${text.slice(0, 500)}`);
-  }
+  // (logUpstreamErrorBody lives in lib/core.js — shared with openai.js)
 
   let body;
   try {
@@ -458,9 +454,10 @@ async function handleMessages(req, res) {
     return sendErrorAnthropic(res, err.message, "invalid_request_error", err.statusCode || 400, "invalid_request");
   }
 
-  if (!body.model || typeof body.model !== "string" || body.model.length > 256 || body.model.includes("..") || /[\r\n\0]/.test(body.model)) {
+  const modelFieldError = validateModelField(body);
+  if (modelFieldError) {
     record(400, { error: "invalid_request" });
-    return sendErrorAnthropic(res, "model must be a valid non-empty string (max 256 chars)", "invalid_request_error", 400, "invalid_model");
+    return sendErrorAnthropic(res, modelFieldError.message, modelFieldError.type, modelFieldError.status, modelFieldError.code);
   }
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     record(400, { error: "invalid_request" });
@@ -480,10 +477,7 @@ async function handleMessages(req, res) {
   currentAnthropicModel = body.model;
   log.info(`messages model=${body.model} -> ${modelId} stream=${stream}`);
 
-  const lastMsgForLog = () => {
-    const lastMsg = openAIBody.messages?.[openAIBody.messages.length - 1];
-    return typeof lastMsg?.content === "string" ? lastMsg.content : JSON.stringify(lastMsg?.content) ?? "";
-  };
+  const lastMsgForLog = () => lastMessagePreview(openAIBody.messages);
 
   // Local AutoClaw WebSocket agent fallback (same trigger rules as the OpenAI
   // entrypoint — this is what gives Anthropic its 402/403/5xx parity).
@@ -505,12 +499,7 @@ async function handleMessages(req, res) {
           if (stream) {
             if (!streamedStart) {
               streamedStart = true;
-              res.writeHead(200, {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-              });
+              res.writeHead(200, SSE_HEADERS);
               res.write(fmt("message_start", {
                 type: "message_start",
                 message: {
@@ -595,27 +584,12 @@ async function handleMessages(req, res) {
       return sendClassifiedErrorAnthropic(res, cachedFailure);
     }
 
-    let upstreamErrBody = "";
-    let upstreamRes = await callUpstreamAnthropic(config.CLIENT_HEADERS, getToken, openAIBody, modelId);
-
-    // One retry for the historically flaky 400 "invalid request" hiccup —
-    // never for models already confirmed permanently broken.
-    if (upstreamRes.statusCode === 400) {
-      upstreamErrBody = await collectResponse(upstreamRes);
-      logUpstreamErrorBody(log, 400, upstreamErrBody);
-      if (upstreamErrBody.includes('"invalid request"') && !permanentFailures.get(modelId)) {
-        log.info("Upstream 400 invalid request — retrying once");
-        await new Promise(r => setTimeout(r, 2000));
-        upstreamRes = await callUpstreamAnthropic(config.CLIENT_HEADERS, getToken, openAIBody, modelId);
-        if (upstreamRes.statusCode >= 400) {
-          upstreamErrBody = await collectResponse(upstreamRes);
-          logUpstreamErrorBody(log, upstreamRes.statusCode, upstreamErrBody);
-        } else upstreamErrBody = "";
-      }
-    } else if (upstreamRes.statusCode >= 400) {
-      upstreamErrBody = await collectResponse(upstreamRes);
-      logUpstreamErrorBody(log, upstreamRes.statusCode, upstreamErrBody);
-    }
+    // Cloud call with one retry on the flaky 400 "invalid request" hiccup;
+    // every >=400 body is buffered + logged (R1). Shared with openai.js.
+    const { res: upstreamRes, errBody: upstreamErrBody } = await callUpstreamWithInvalidRequestRetry(
+      () => callUpstreamAnthropic(config.CLIENT_HEADERS, getToken, openAIBody, modelId),
+      modelId, permanentFailures, log,
+    );
 
     const statusCode = upstreamRes.statusCode;
 
@@ -650,12 +624,7 @@ async function handleMessages(req, res) {
     record(statusCode, { lastMessage: lastMsgForLog(), messageCount: openAIBody.messages?.length || 0 });
 
     if (stream) {
-      res.writeHead(200, {
-        "Content-Type":      "text/event-stream",
-        "Cache-Control":     "no-cache",
-        "Connection":        "keep-alive",
-        "X-Accel-Buffering": "no",
-      });
+      res.writeHead(200, SSE_HEADERS);
 
       res.write(fmt("message_start", {
         type:    "message_start",
