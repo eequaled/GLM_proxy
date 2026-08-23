@@ -426,7 +426,7 @@ async function handleMessages(req, res) {
 
   // Exactly one observability entry per request (`via` marks cloud vs local).
   let recorded = false;
-  function record(status, { lastMessage = null, messageCount = 0, error, via = "cloud" } = {}) {
+  function record(status, { lastMessage = null, messageCount = 0, error, via = "cloud", cloud_status, cloud_error } = {}) {
     if (recorded) return;
     recorded = true;
     logRequest({
@@ -437,8 +437,17 @@ async function handleMessages(req, res) {
         : JSON.stringify(lastMessage)?.substring(0, 300) ?? "",
       ...(messageCount ? { message_count: messageCount } : {}),
       ...(error ? { error } : {}),
+      ...(cloud_status ? { cloud_status, ...(cloud_error ? { cloud_error } : {}) } : {}),
     });
     logJsonl({ model: currentModelId, status, ip: clientIp, latencyMs: Date.now() - startTime, ...(via !== "cloud" ? { via } : {}), ...(error ? { error } : {}) });
+  }
+
+  // R1: never let an upstream rejection pass without its body on record —
+  // quota walls hide behind bare status codes. One compact line, capped.
+  function logUpstreamErrorBody(logger, status, bodyText) {
+    const text = typeof bodyText === "string" ? bodyText.replace(/\s+/g, " ").trim() : "";
+    if (!text) return;
+    logger.warn(`Upstream ${status} body: ${text.slice(0, 500)}`);
   }
 
   let body;
@@ -585,15 +594,19 @@ async function handleMessages(req, res) {
     // never for models already confirmed permanently broken.
     if (upstreamRes.statusCode === 400) {
       upstreamErrBody = await collectResponse(upstreamRes);
+      logUpstreamErrorBody(log, 400, upstreamErrBody);
       if (upstreamErrBody.includes('"invalid request"') && !permanentFailures.get(modelId)) {
         log.info("Upstream 400 invalid request — retrying once");
         await new Promise(r => setTimeout(r, 2000));
         upstreamRes = await callUpstreamAnthropic(config.CLIENT_HEADERS, getToken, openAIBody, modelId);
-        if (upstreamRes.statusCode >= 400) upstreamErrBody = await collectResponse(upstreamRes);
-        else upstreamErrBody = "";
+        if (upstreamRes.statusCode >= 400) {
+          upstreamErrBody = await collectResponse(upstreamRes);
+          logUpstreamErrorBody(log, upstreamRes.statusCode, upstreamErrBody);
+        } else upstreamErrBody = "";
       }
-    } else if (upstreamRes.statusCode === 401) {
+    } else if (upstreamRes.statusCode >= 400) {
       upstreamErrBody = await collectResponse(upstreamRes);
+      logUpstreamErrorBody(log, upstreamRes.statusCode, upstreamErrBody);
     }
 
     const statusCode = upstreamRes.statusCode;

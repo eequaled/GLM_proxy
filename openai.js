@@ -155,8 +155,10 @@ async function handleChatCompletions(req, res) {
 
   // Exactly one observability entry per request, written at the terminal
   // outcome — cloud-served AND local-agent-served alike (`via` marks which).
+  // Optional cloud_status/cloud_error carry the rejected cloud attempt's
+  // evidence when fallback ended up serving the request.
   let recorded = false;
-  function record(status, { model = null, lastMessage = null, messageCount = 0, error, via = "cloud" } = {}) {
+  function record(status, { model = null, lastMessage = null, messageCount = 0, error, via = "cloud", cloud_status, cloud_error } = {}) {
     if (recorded) return;
     recorded = true;
     if (model) {
@@ -168,9 +170,19 @@ async function handleChatCompletions(req, res) {
           : JSON.stringify(lastMessage)?.substring(0, 300) ?? "",
         ...(messageCount ? { message_count: messageCount } : {}),
         ...(error ? { error } : {}),
+        ...(cloud_status ? { cloud_status, ...(cloud_error ? { cloud_error } : {}) } : {}),
       });
     }
     logJsonl({ model, status, ip: clientIp, latencyMs: Date.now() - startTime, ...(via !== "cloud" ? { via } : {}), ...(error ? { error } : {}) });
+  }
+
+  // R1: never let an upstream rejection pass without its body on record —
+  // last night's quota walls hid behind bare status codes. Single compact
+  // line, whitespace-collapsed, capped at 500 chars.
+  function logUpstreamErrorBody(logger, status, bodyText) {
+    const text = typeof bodyText === "string" ? bodyText.replace(/\s+/g, " ").trim() : "";
+    if (!text) return;
+    logger.warn(`Upstream ${status} body: ${text.slice(0, 500)}`);
   }
 
   let body;
@@ -203,6 +215,11 @@ async function handleChatCompletions(req, res) {
     const lastMsg = body.messages?.[body.messages.length - 1];
     return typeof lastMsg?.content === "string" ? lastMsg.content : JSON.stringify(lastMsg?.content) ?? "";
   };
+
+  // Cloud-attempt evidence (status + classifier code) set when the cloud
+  // rejected this request before fallback ran; consumed by record() so the
+  // terminal ring entry carries the full story.
+  let cloudEvidence = null;
 
   // Local AutoClaw WebSocket agent fallback. Returns true when the response
   // was fully handled here (success OR terminal error), false when the local
@@ -262,7 +279,10 @@ async function handleChatCompletions(req, res) {
             });
           }
           log.info(`chat model=${modelId} served via local agent (${Date.now() - startedAt}ms)`);
-          record(200, { model: modelId, lastMessage: fullContent, messageCount: body.messages?.length || 0, via: "local" });
+          record(200, {
+            model: modelId, lastMessage: fullContent, messageCount: body.messages?.length || 0, via: "local",
+            ...(cloudEvidence ? { cloud_status: cloudEvidence.status, cloud_error: cloudEvidence.code } : {}),
+          });
           resolve(true);
         },
         onError: (err) => {
@@ -273,9 +293,12 @@ async function handleChatCompletions(req, res) {
             // SSE already went out with 200 — a JSON 502 cannot follow.
             // Terminate the stream instead of throwing ERR_HTTP_HEADERS_SENT.
             try { res.end(); } catch (_) {}
-            record(cls.status, { model: modelId, error: `${cls.code} (mid-stream)`, via: "local" });
+            record(cls.status, { model: modelId, error: `${cls.code} (mid-stream)`, via: "local", ...(cloudEvidence ? { cloud_status: cloudEvidence.status, cloud_error: cloudEvidence.code } : {}) });
           } else {
-            record(cls.status, { model: modelId, error: cls.code, via: "local" });
+            record(cls.status, {
+              model: modelId, error: cls.code, via: "local",
+              ...(cloudEvidence ? { cloud_status: cloudEvidence.status, cloud_error: cloudEvidence.code } : {}),
+            });
             sendClassifiedErrorOpenAI(res, cls);
           }
           resolve(true);
@@ -332,6 +355,7 @@ async function handleChatCompletions(req, res) {
     // but never for a model we've already confirmed permanently broken.
     if (statusCode === 400) {
       upstreamErrBody = await collectResponse(upstreamRes);
+      logUpstreamErrorBody(log, statusCode, upstreamErrBody);
       if (upstreamErrBody.includes('"invalid request"') && !permanentFailures.get(modelId)) {
         log.info("Upstream 400 invalid request — retrying once");
         await new Promise(r => setTimeout(r, 2000));
@@ -341,9 +365,11 @@ async function handleChatCompletions(req, res) {
         }
         upstreamRes = retried;
         upstreamErrBody = await collectResponse(retried);
+        logUpstreamErrorBody(log, retried.statusCode, upstreamErrBody);
       }
-    } else if (statusCode === 401) {
+    } else if (statusCode >= 400) {
       upstreamErrBody = await collectResponse(upstreamRes);
+      logUpstreamErrorBody(log, statusCode, upstreamErrBody);
     }
 
     const effectiveStatus = upstreamRes.statusCode;
@@ -356,6 +382,7 @@ async function handleChatCompletions(req, res) {
       const cls = classifyUpstreamError(effectiveStatus, upstreamErrBody, modelId);
       if (cls.permanent) permanentFailures.mark(modelId, cls);
       log.error(`Upstream error ${effectiveStatus}:`, cls.message);
+      cloudEvidence = { status: effectiveStatus, code: cls.code };
 
       // The desktop gateway shares this AutoClaw account — a quota/plan wall
       // stops it too, so don't march a known-permanent failure into it.
@@ -365,7 +392,13 @@ async function handleChatCompletions(req, res) {
         log.info(`Skipping local fallback for ${modelId}: ${cls.code} is account-wide`);
       }
 
-      record(cls.status, { model: modelId, lastMessage: lastMsgForLog(), messageCount: body.messages?.length || 0, error: cls.code });
+      record(cls.status, {
+        model: modelId, lastMessage: lastMsgForLog(), messageCount: body.messages?.length || 0,
+        error: cls.code,
+        // cloud evidence rides along on the terminal entry — the test CLI
+        // renders [cloud NNN → local agent] from these fields
+        ...(effectiveStatus !== cls.status ? { cloud_status: effectiveStatus, cloud_error: cls.code } : {}),
+      });
       return sendClassifiedErrorOpenAI(res, cls);
     }
 
