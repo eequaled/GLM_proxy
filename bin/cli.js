@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import path from "path";
+import fs from "fs";
 import { fileURLToPath, pathToFileURL } from "url";
 import { promptSelect, promptInput, promptNumber } from "../lib/prompts.js";
 import http from "http";
@@ -39,6 +40,32 @@ function showHelp() {
     TRUSTED_PROXIES   Comma-separated IPs whose X-Forwarded-For header is trusted
   `);
   process.exit(0);
+}
+
+// Cloud-attempt evidence from the isolated test ring: entries are terminal
+// outcomes only, so a cloud rejection shows up as the final record of an
+// otherwise local-served request. Scan every entry for this model in this run
+// and derive a compact summary — last non-local status, "cloud ok" if any
+// non-local 200 exists, or nothing at all when no cloud evidence was written.
+function deriveCloudStatus(entries) {
+  const relevant = entries.filter((e) => e.via !== "local");
+  if (!relevant.length) return null;
+  if (relevant.some((e) => e.status === 200)) return `cloud ${COLORS.GREEN}ok${COLORS.RESET}`;
+  const last = relevant[relevant.length - 1];
+  return `cloud ${last.status}`;
+}
+
+function readTestRing(filePath, sinceTs) {
+  try {
+    const entries = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    if (!Array.isArray(entries)) return [];
+    return entries.filter((e) => {
+      const ts = Date.parse(e.timestamp || e.ts || "");
+      // Tolerate missing timestamps: the ring is capped at 50 entries and the
+      // test log is isolated per-run, so anything without one is still ours.
+      return Number.isNaN(ts) ? true : ts >= sinceTs;
+    });
+  } catch (_) { return []; }
 }
 
 async function runModelTests() {
@@ -104,6 +131,9 @@ async function runModelTests() {
   // point the operator at the isolated log for per-request attribution.
   console.log(`  Request log  : ${path.basename(testEnvLog)}\n`);
 
+  // Cloud-evidence baseline: only entries written from this run onward count.
+  const runStart = Date.now() - 1000;
+
   for (const model of catalog.models) {
     process.stdout.write(`  Testing ${COLORS.CYAN}${model.name}${COLORS.RESET} (${model.id})... `);
     const startTime = Date.now();
@@ -138,6 +168,11 @@ async function runModelTests() {
       });
 
       const elapsed = Date.now() - startTime;
+      // Give the proxy a beat to flush its ring write before we read it back
+      await new Promise((r) => setTimeout(r, 150));
+      const cloudStatus = deriveCloudStatus(
+        readTestRing(testEnvLog, runStart).filter((e) => e.model === model.id),
+      );
       if (result.status === 200) {
         let answer = "";
         let servedBy = "";
@@ -147,8 +182,8 @@ async function runModelTests() {
           // Attribution: responses assembled by the local-agent fallback carry
           // zero usage counters — cloud answers report real token usage.
           servedBy = parsed.usage?.prompt_tokens === 0 && parsed.usage?.completion_tokens === 0
-            ? ` ${COLORS.MAGENTA}[via local agent]${COLORS.RESET}`
-            : "";
+            ? ` ${COLORS.MAGENTA}[${cloudStatus ?? "cloud n/a"} → local agent]${COLORS.RESET}`
+            : cloudStatus ? ` ${COLORS.GRAY}[${cloudStatus}]${COLORS.RESET}` : "";
         } catch {}
         const preview = answer.length > 40 ? answer.slice(0, 40) + "…" : answer;
         console.log(`${COLORS.BLUE}✔ working${COLORS.RESET}${servedBy} ${COLORS.GRAY}(${elapsed}ms) → ${preview}${COLORS.RESET}`);
@@ -163,6 +198,7 @@ async function runModelTests() {
     }
   }
 
+  console.log(`\n  ${COLORS.GRAY}Legend: [cloud NNN → local agent] = cloud rejected the request (HTTP NNN), the desktop-app fallback served it instead.${COLORS.RESET}`);
   console.log("");
   proxyProc.kill();
   await new Promise((r) => setTimeout(r, 300));

@@ -1,24 +1,64 @@
 name: CI
+
 on:
   push:
-    branches: [master, L-route]
+    branches: [L-route, master]
   pull_request:
     branches: [master]
+  workflow_dispatch:
+
 jobs:
-  test:
+  unit-and-static:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node-version: [18, 20, 22]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
-      - run: node --check openai.js
-      - run: node --check anthropic.js
-      - run: node --check lib/core.js
-      - run: node --check bin/cli.js
-      - run: npm test
-        env:
-          RATE_LIMIT: "200"
+          node-version: 20
+          cache: npm
+      # No package-lock.json in the repo root, so npm ci is not applicable.
+      - run: npm install
+      - run: node --check lib/core.js && node --check openai.js && node --check anthropic.js && node --check bin/cli.js
+      - run: node tests/taxonomy.mjs
+
+  pen-tests-fast:
+    needs: unit-and-static
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm install
+      - run: node tests/pen-test-p1.mjs && node tests/pen-test-p2.mjs && node tests/pen-test-p3.mjs && node tests/pen-test-p4.mjs
+
+  pen-tests-live:
+    needs: unit-and-static
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm install
+      - run: node tests/pen-test-p5.mjs && node tests/catalog-refresh.mjs
+
+  upload-logs:
+    needs: [unit-and-static, pen-tests-fast, pen-tests-live]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect ring/request logs
+        run: mkdir -p artifacts && cp proxy_requests*.json proxy_requests*.jsonl artifacts/ 2>/dev/null || true
+      - name: Upload ring/request logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ring-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/
+          retention-days: 3
+          if-no-files-found: ignore
