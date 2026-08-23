@@ -19,18 +19,30 @@ check("rate limiter returns 429 on burst", had429);
 
 // JSONL log: verify file was written after a successful request
 await new Promise(r => setTimeout(r, 1200)); // wait for token bucket refill
-await chat();
-await new Promise(r => setTimeout(r, 1000)); // let appendFile flush
-const jsonlOk = existsSync(JSONL_PATH);
+// Live upstream sometimes throttles right after p4's concurrency barrage and
+// fails requests at the transport level — one retry before giving up.
+let jsonlOk = false;
+for (let i = 0; i < 3 && !jsonlOk; i++) {
+  await chat();
+  for (let j = 0; j < 12 && !jsonlOk; j++) {
+    await new Promise(r => setTimeout(r, 500));
+    jsonlOk = existsSync(JSONL_PATH);
+  }
+}
 if (!jsonlOk) console.log("  (debug: JSONL file not found at", JSONL_PATH, ")");
 check("JSONL log file written", jsonlOk);
 
 await new Promise(r => setTimeout(r, 1200)); // wait for token bucket refill
-  // Smoke-test: pipeline works — any well-formed classified response is fine
-  // (200 cloud/local, or a typed error: 400 invalid, 402 quota, 404 unknown,
-  // 429 rate-limited, 502 upstream, 503 no token, 504 timeout)
-  const smoke = await chat({ model: "zai_glm-5-turbo" });
-  check("regular request still passes after hardening", smoke.status === 200 || (smoke.status >= 400 && smoke.status <= 504), smoke.status);
+// Smoke-test: pipeline works — any well-formed classified response is fine
+// (200 cloud/local, or a typed error: 400 invalid, 402 quota, 404 unknown,
+// 429 rate-limited, 502 upstream, 503 no token, 504 timeout). Status 0 means
+// the upstream throttled the transport itself — retry once before judging.
+let smoke = await chat({ model: "zai_glm-5-turbo" });
+if (smoke.status === 0) {
+  await new Promise(r => setTimeout(r, 3000));
+  smoke = await chat({ model: "zai_glm-5-turbo" });
+}
+check("regular request still passes after hardening", smoke.status === 200 || (smoke.status >= 400 && smoke.status <= 504), smoke.status);
 
 // 401 still works (auth check intact)
 const noAuth = await post(PORT, { body: { model: "zai_auto", messages: [{ role: "user", content: "hi" }] }, headers: { Authorization: null } });
