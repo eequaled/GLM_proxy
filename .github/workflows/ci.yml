@@ -7,58 +7,77 @@ on:
     branches: [master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # Required gate: static syntax checks + pure-unit taxonomy tests.
+  # Matrix covers the oldest supported line (engines >=18 floor is 20 here)
+  # and the current LTS. Zero dependencies: no lockfile, no npm cache,
+  # nothing to install.
   unit-and-static:
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 24]
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
-          cache: npm
-      # No package-lock.json in the repo root, so npm ci is not applicable.
-      - run: npm install
+          node-version: ${{ matrix.node-version }}
       - run: node --check lib/core.js && node --check openai.js && node --check anthropic.js && node --check bin/cli.js
       - run: node tests/taxonomy.mjs
 
+  # Live-upstream suites: gated by cloud availability, so they run
+  # continue-on-error and must never redden code PRs. Each uploads whatever
+  # request logs its own workspace produced (workspaces are ephemeral — a
+  # separate collector job would find nothing).
   pen-tests-fast:
     needs: unit-and-static
     continue-on-error: true
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
-          cache: npm
-      - run: npm install
+          node-version: 24
       - run: node tests/pen-test-p1.mjs && node tests/pen-test-p2.mjs && node tests/pen-test-p3.mjs && node tests/pen-test-p4.mjs
+      - name: Upload request logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ring-logs-fast-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            proxy_requests*.json
+            proxy_requests*.jsonl
+          retention-days: 3
+          if-no-files-found: ignore
 
   pen-tests-live:
     needs: unit-and-static
     continue-on-error: true
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
-          cache: npm
-      - run: npm install
+          node-version: 24
       - run: node tests/pen-test-p5.mjs && node tests/catalog-refresh.mjs
-
-  upload-logs:
-    needs: [unit-and-static, pen-tests-fast, pen-tests-live]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Collect ring/request logs
-        run: mkdir -p artifacts && cp proxy_requests*.json proxy_requests*.jsonl artifacts/ 2>/dev/null || true
-      - name: Upload ring/request logs
+      - name: Upload request logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ring-logs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/
+          name: ring-logs-live-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            proxy_requests*.json
+            proxy_requests*.jsonl
           retention-days: 3
           if-no-files-found: ignore
