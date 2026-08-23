@@ -487,6 +487,9 @@ async function handleMessages(req, res) {
 
   // Local AutoClaw WebSocket agent fallback (same trigger rules as the OpenAI
   // entrypoint — this is what gives Anthropic its 402/403/5xx parity).
+  // Set when the cloud upstream rejects the request before fallback runs;
+  // consumed by record() so the terminal entry carries the cloud verdict.
+  let cloudEvidence = null;
   const tryLocalAgent = () => {
     if (!getLocalGatewayToken()) return Promise.resolve(false);
     log.info(`Executing chat model=${modelId} via local AutoClaw WebSocket agent...`);
@@ -552,7 +555,12 @@ async function handleMessages(req, res) {
             });
           }
           log.info(`chat model=${modelId} served via local agent (${Date.now() - startedAt}ms)`);
-          record(200, { lastMessage: fullContent, messageCount: openAIBody.messages?.length || 0, via: "local" });
+          record(200, {
+            lastMessage: fullContent,
+            messageCount: openAIBody.messages?.length || 0,
+            via: "local",
+            ...(cloudEvidence ? { cloud_status: cloudEvidence.status, cloud_error: cloudEvidence.code } : {}),
+          });
           resolve(true);
         },
         onError: (err) => {
@@ -563,9 +571,9 @@ async function handleMessages(req, res) {
             // Stream already started — close it rather than throwing a
             // second writeHead onto a spent response.
             try { res.end(); } catch (_) {}
-            record(cls.status, { error: `${cls.code} (mid-stream)`, via: "local" });
+            record(cls.status, { error: `${cls.code} (mid-stream)`, via: "local", ...(cloudEvidence ? { cloud_status: cloudEvidence.status, cloud_error: cloudEvidence.code } : {}) });
           } else {
-            record(cls.status, { error: cls.code, via: "local" });
+            record(cls.status, { error: cls.code, via: "local", ...(cloudEvidence ? { cloud_status: cloudEvidence.status, cloud_error: cloudEvidence.code } : {}) });
             sendClassifiedErrorAnthropic(res, cls);
           }
           resolve(true);
@@ -619,6 +627,7 @@ async function handleMessages(req, res) {
       const cls = classifyUpstreamError(statusCode, upstreamErrBody, modelId);
       if (cls.permanent) permanentFailures.mark(modelId, cls);
       log.error(`Upstream error ${statusCode}:`, cls.message);
+      cloudEvidence = { status: statusCode, code: cls.code };
 
       // The desktop gateway shares this AutoClaw account — quota walls stop
       // it too, so don't march known-permanent failures into it.
@@ -628,7 +637,12 @@ async function handleMessages(req, res) {
         log.info(`Skipping local fallback for ${modelId}: ${cls.code} is account-wide`);
       }
 
-      record(cls.status, { lastMessage: lastMsgForLog(), messageCount: openAIBody.messages?.length || 0, error: cls.code });
+      record(cls.status, {
+        lastMessage: lastMsgForLog(),
+        messageCount: openAIBody.messages?.length || 0,
+        error: cls.code,
+        ...(statusCode !== cls.status ? { cloud_status: statusCode, cloud_error: cls.code } : {}),
+      });
       return sendClassifiedErrorAnthropic(res, cls);
     }
 

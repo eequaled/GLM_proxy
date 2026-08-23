@@ -43,16 +43,17 @@ function showHelp() {
 }
 
 // Cloud-attempt evidence from the isolated test ring: entries are terminal
-// outcomes only, so a cloud rejection shows up as the final record of an
-// otherwise local-served request. Scan every entry for this model in this run
-// and derive a compact summary — last non-local status, "cloud ok" if any
-// non-local 200 exists, or nothing at all when no cloud evidence was written.
+// outcomes only. A cloud-served success is its own via!=="local" 200; a
+// locally-served request that the cloud rejected first carries its verdict
+// in cloud_status on that same entry. Scan every entry for this model in
+// this run and derive a compact summary.
 function deriveCloudStatus(entries) {
-  const relevant = entries.filter((e) => e.via !== "local");
-  if (!relevant.length) return null;
-  if (relevant.some((e) => e.status === 200)) return `cloud ${COLORS.GREEN}ok${COLORS.RESET}`;
-  const last = relevant[relevant.length - 1];
-  return `cloud ${last.status}`;
+  if (entries.some((e) => e.via !== "local" && e.status === 200)) {
+    return `cloud ${COLORS.GREEN}ok${COLORS.RESET}`;
+  }
+  const withEvidence = entries.filter((e) => e.cloud_status != null);
+  if (!withEvidence.length) return null;
+  return `cloud ${withEvidence[withEvidence.length - 1].cloud_status}`;
 }
 
 function readTestRing(filePath, sinceTs) {
