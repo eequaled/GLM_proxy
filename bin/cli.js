@@ -18,7 +18,7 @@ const FLAGS = ["--anthropic", "--openai", "--port", "--host", "--key", "--rate-l
 
 function showHelp() {
   console.log(`
-  🛸  AutoClaw Gateway CLI
+    AutoClaw Gateway CLI
   ───────────────────────────────────────────
   Usage:
     npx autoclaw-gateway [options]

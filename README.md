@@ -15,6 +15,14 @@
 
 ---
 
+## Models are fetched automatically
+
+Point any OpenAI-compatible harness at `http://127.0.0.1:18791/v1` and it can pull the **live model catalog** through `GET /v1/models` — no config to maintain. The list is re-read from AutoClaw's runtime catalog on every request, so models AutoClaw adds or removes show up without a proxy restart. The Anthropic entrypoint (`/v1/models` on port `18792`) serves the same catalog in Anthropic's list shape.
+
+**GLM-5.3-Flash (known as "OX-alpha")** is in the proxy too — served through the local-agent route (see [Models](#models) for the exact caveats).
+
+---
+
 Two API formats, one launcher. `node bin/cli.js` asks which one you want with an arrow-key menu and starts the right proxy. Flags skip the menu.
 
 | Format | Flag | Default port | Use with |
@@ -54,6 +62,8 @@ Your App           AutoClaw Proxy CLI         AutoClaw Backend
 
 AutoClaw handles authentication automatically. As long as AutoClaw is running and you're logged in, the proxy will work — no manual token setup needed.
 
+The proxy speaks AutoClaw's native upstream dialect (client headers, bare model ids, and the app's system-prompt banner injected into every request — without that banner the cloud returns 400 `"invalid request"`). When the cloud fails, requests fall back to AutoClaw's own desktop agent over a local WebSocket (`127.0.0.1:18789`).
+
 ## Prerequisites
 
 - [AutoClaw](https://autoclaw.com) installed, running, and logged in (Windows / macOS only)
@@ -66,7 +76,7 @@ npm start
 # or: node bin/cli.js
 ```
 
-You get an interactive menu: arrow keys to move, Enter to pick. Choose the format, port, host, and auth key, and the proxy starts. Ctrl+C quits cleanly and restores your terminal.
+You get an interactive menu: arrow keys to move, Enter to pick. Choose the format, port, host, and auth key, and the proxy starts. Ctrl+C quits cleanly and restores your terminal. The menu also offers **Model Doctor** (catalog + credit-tier routing) and **Test Models** (live health check) without starting a proxy.
 
 Skip the menu with flags:
 
@@ -88,7 +98,7 @@ Without a TTY (piped stdin, CI), the CLI skips the menu and starts the OpenAI fo
 |---------|--------------|
 | `npm start` | Launch the interactive CLI (`node bin/cli.js`) |
 | `npm run anthropic` | Start the Anthropic proxy directly (`node anthropic.js`), bypassing the menu |
-| `npm test` | Run the pen-test suite (`tests/pen-test-p1` through `p5`) |
+| `npm test` | Run the pen-test suite (`tests/pen-test-p1` through `p5`), plus the error-taxonomy tests (`tests/taxonomy.mjs`) and runtime-catalog refresh test (`tests/catalog-refresh.mjs`) |
 
 ### Direct entry points (optional)
 
@@ -111,6 +121,7 @@ They read the same env vars and respect `HOST`, `PORT`, `PROXY_KEY`, `RATE_LIMIT
 | `RATE_LIMIT` / `--rate-limit` | `30` | Max requests per second per client IP |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `silent` |
 | `PREFER_LOCAL` | off | Set to `1` to use the local AutoClaw gateway first, skipping cloud attempts |
+| `TRUSTED_PROXIES` | empty | Comma-separated IPs whose `X-Forwarded-For` header is trusted for rate limiting |
 | `MAX_BODY_BYTES` | `52428800` | Max request body (50 MB) |
 | `JSONL_LOG` | off | Write structured JSONL request log when `true` |
 | `JSONL_FILE` | `proxy_requests.jsonl` (Anthropic: `proxy_requests_anthropic.jsonl`) | JSONL output path |
@@ -118,6 +129,7 @@ They read the same env vars and respect `HOST`, `PORT`, `PROXY_KEY`, `RATE_LIMIT
 | `--anthropic` | — | Run in Anthropic API format |
 | `--openai` | — | Run in OpenAI API format (default) |
 | `--doctor` | — | Scan AutoClaw's current runtime model catalog and show Anthropic routing |
+| `--test-models` / `--test` | — | Live health check: test every catalog model through the full pipeline |
 | `--help`, `-h` | — | Show CLI help |
 
 ### JSONL Request Logging
@@ -130,6 +142,8 @@ Set `JSONL_LOG=true` (or `LOG_LEVEL=debug`) to write one JSON line per request:
 
 The Anthropic variant writes to `proxy_requests_anthropic.jsonl`.
 
+Alongside the JSONL stream, a compact ring log (`proxy_requests.json`, last 50 entries) records every terminal outcome — including `via: "local"` and the cloud verdict (`cloud_status` / `cloud_error`) when the cloud rejected a request that the local agent ended up serving.
+
 ### Model doctor
 
 Run the doctor to scan AutoClaw's live model catalog with **credit tiers** fetched from its remote model-config (falling back to the runtime file, then built-ins), and print the Claude alias routing map computed by the same resolver the Anthropic proxy uses:
@@ -139,6 +153,22 @@ node bin/cli.js --doctor
 ```
 
 Anthropic routing follows credit tiers: opus → High, sonnet → Medium, haiku → Low. UI display names can differ from API ids (the API's `zaicoding_glm-5.3` shows as "GLM-5.2" in AutoClaw's UI).
+
+### Model health test
+
+```bash
+node bin/cli.js --test-models
+```
+
+Spawns a throwaway proxy on a test port and fires a minimal prompt at **every model in the catalog**, reporting live status per model:
+
+```
+  ✔ working [cloud ok] (1.2s) → PONG
+  ✔ working [cloud 402 → local agent] (38.4s) → PONG 🦞
+  ✗ failed (404) (0.9s) → Model ... is not recognized by AutoClaw upstream
+```
+
+The cloud verdict comes from the isolated test ring log: a `[cloud ok]` tag means the cloud served it; `[cloud NNN → local agent]` means the cloud rejected it (HTTP NNN) and AutoClaw's desktop-agent fallback answered. Zero-usage responses are the local-agent signature. The test uses isolated log files so it never clobbers your running proxy's records.
 
 ## API
 
@@ -157,7 +187,25 @@ Returns token status and upstream info.
 
 ### `GET /v1/models`
 
-Lists available models in OpenAI format (OpenAI proxy) or Anthropic format (Anthropic proxy).
+Lists available models in OpenAI format (OpenAI proxy) or Anthropic format (Anthropic proxy). The catalog is **re-read from AutoClaw's runtime file on every call** — no restart needed when AutoClaw's model list changes:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "zai_auto",
+      "object": "model",
+      "owned_by": "autoclaw",
+      "name": "Auto",
+      "context_window": 1048576,
+      "max_tokens": 393216
+    }
+  ]
+}
+```
+
+Any OpenAI-compatible harness pointed at `http://127.0.0.1:18791/v1` will pick this list up automatically.
 
 ### `POST /v1/chat/completions` — OpenAI proxy
 
@@ -207,12 +255,13 @@ When the cloud upstream fails (and it's not a plain 404/429), the proxy re-runs 
 | `zai_auto` | Auto | 1M | 393K | Routes to AutoClaw's optimal model |
 | `zaicoding_glm-5.3` | GLM-5.3 | 1M | 307K | Latest GLM coding model |
 | `zai_glm-5-turbo` | GLM-5-Turbo | 200K | 131K | Zhipu AI GLM-5 Turbo |
+| `zai_glm-5.3-flash` | GLM-5.3-Flash ("OX-alpha") | — | — | Newest GLM flash model. Not in AutoClaw's cloud catalog yet: the cloud upstream 400s it, so it's served via the local-agent fallback only, and won't appear in `/v1/models` until AutoClaw's catalog includes it |
 | `tdpsk_deepseek-v4-flash-202605` | Deepseek-V4-Flash | 1M | 393K | Fast DeepSeek model |
 | `tdpsk_deepseek-v4-pro-202606` | DeepSeek-V4-Pro | 1M | 393K | Deep reasoning model |
 
 > GLM 5.3 new in the proxy? Maybe. Supposedly in the UI it's 5.2 but in the API it's 5.3. We'll never know, but it's a win-win xd.
 
-All models include `reasoning_content` in responses when the upstream model reasons. The model list is loaded dynamically from AutoClaw's `openclaw.runtime.json` at startup, with a built-in fallback if that file isn't readable. Run `node bin/cli.js --doctor` to inspect the current catalog after an AutoClaw update.
+All models include `reasoning_content` in responses when the upstream model reasons. The model list is loaded dynamically from AutoClaw's `openclaw.runtime.json` (re-read on every `/v1/models` call, so the catalog stays live), with a built-in fallback if that file isn't readable. Run `node bin/cli.js --doctor` to inspect the current catalog after an AutoClaw update.
 
 ## Integrations
 
@@ -232,7 +281,8 @@ All models include `reasoning_content` in responses when the upstream model reas
         "zai_auto": { "name": "AutoClaw Auto" },
         "zaicoding_glm-5.3": { "name": "AutoClaw GLM-5.3" },
         "zai_glm-5-turbo": { "name": "AutoClaw GLM-5 Turbo" },
-        "tdpsk_deepseek-v4-flash-202605": { "name": "AutoClaw Deepseek-V4-Flash" }
+        "tdpsk_deepseek-v4-flash-202605": { "name": "AutoClaw Deepseek-V4-Flash" },
+        "tdpsk_deepseek-v4-pro-202606": { "name": "AutoClaw DeepSeek-V4-Pro" }
       }
     }
   }
@@ -305,7 +355,7 @@ for await (const chunk of stream) {
 
 ### Cursor / Continue / Other Tools
 
-Any tool that supports OpenAI-compatible providers works. Point it at `http://localhost:18791/v1` with API key `mewmew` and you're set.
+Any tool that supports OpenAI-compatible providers works. Point it at `http://localhost:18791/v1` with API key `mewmew` and you're set. Harnesses that probe for available models will get the live list from `/v1/models` automatically.
 
 ## Notes
 
@@ -313,9 +363,11 @@ Any tool that supports OpenAI-compatible providers works. Point it at `http://lo
 - `PROXY_KEY` is just a local password for this proxy, not your AutoClaw credentials — set it to whatever you want
 - On a 401, the proxy invalidates its cached token and you can retry immediately
 - Upstream 400 "invalid request" gets one retry after a 2s delay (a known upstream hiccup); quota/plan errors are never retried
+- The cloud upstream requires AutoClaw's app system-prompt banner in every request. their new verification — the proxy injects it automatically (and never duplicates it). but it doesnt change much in practice/ my own testing and others testing. since it will be overridden by the harnesses own system prompt.  
 - When cloud fails, requests fall back to AutoClaw's local desktop agent (`via: "local"` in logs) unless the model just failed permanently there too
 - The token file is watched for changes — AutoClaw can rotate auth mid-session without a restart
 - Rate limit is enforced per client IP (default 30 req/s); X-Forwarded-For is only honored from `TRUSTED_PROXIES`
+- The ring log records cloud verdicts alongside local fallbacks, so every response is attributable
 - No dependencies at all: the interactive menu is hand-rolled on Node's built-in `readline`, so there's zero `node_modules` and zero install step
 
 ## Special Thanks
