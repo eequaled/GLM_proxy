@@ -80,7 +80,7 @@ async function checkProxy(entrypoint, messagePath) {
 }
 
 try {
-  await checkProxy("main.js", "/v1/chat/completions");
+  await checkProxy("openai.js", "/v1/chat/completions");
   await checkProxy("anthropic.js", "/v1/messages");
   console.log("catalog refresh passed");
 } finally {

@@ -2,5 +2,6 @@
 .env
 proxy_requests.json
 proxy_requests_anthropic.json
-proxy_requests.jsonl
-proxy_requests_anthropic.jsonl
+proxy_requests_test.json
+proxy_requests*.jsonl
+proxy_requests*.lock
