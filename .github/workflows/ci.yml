@@ -31,7 +31,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
-      - run: node --check lib/core.js && node --check openai.js && node --check anthropic.js && node --check bin/cli.js
+      - run: node --check lib/core.js && node --check openai.js && node --check anthropic.js && node --check bin/cli.js && node --check main.js
       - run: node tests/taxonomy.mjs
 
   # Live-upstream suites: gated by cloud availability, so they run

@@ -195,7 +195,7 @@ async function handleChatCompletions(req, res) {
     record(400, { error: "invalid_request" });
     return sendErrorOpenAI(res, modelFieldError.message, modelFieldError.type, modelFieldError.status, modelFieldError.code);
   }
-  const payloadError = validateChatPayload(body);
+  const payloadError = validateChatPayload(body, config.MAX_MESSAGES);
   if (payloadError) {
     record(payloadError.statusCode, { model: body.model, error: "payload_too_large" });
     return sendErrorOpenAI(res, payloadError.message, "invalid_request_error", payloadError.statusCode, "invalid_payload");
@@ -409,6 +409,7 @@ server.listen(config.PORT, HOST, () => {
       `Port     : ${config.PORT}`,
       `Auth Key : ${config.PROXY_KEY}`,
       `Rate Lim : ${config.RATE_LIMIT} req/s per IP`,
+      `Max Msgs : ${config.MAX_MESSAGES} entries`,
       `Models   : ${MODELS.map(m => m.id).join(", ")}`,
       "",
       "OpenCode / OpenAI SDK Base URL:",

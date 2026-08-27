@@ -15,6 +15,7 @@ jobs:
       - run: node --check anthropic.js
       - run: node --check lib/core.js
       - run: node --check bin/cli.js
+      - run: node --check main.js
       - run: npm test
         env:
           RATE_LIMIT: "200"

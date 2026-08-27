@@ -11,6 +11,7 @@
   "files": [
     "openai.js",
     "anthropic.js",
+    "main.js",
     "bin/",
     "lib/"
   ],

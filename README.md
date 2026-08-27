@@ -119,6 +119,7 @@ They read the same env vars and respect `HOST`, `PORT`, `PROXY_KEY`, `RATE_LIMIT
 | `HOST` / `--host` | `127.0.0.1` | Bind address |
 | `PROXY_KEY` / `--key` | `mewmew` | API key clients must send |
 | `RATE_LIMIT` / `--rate-limit` | `30` | Max requests per second per client IP |
+| `MAX_MESSAGES` / `--max-messages` | `128` | Max message / entity limit in request payload (e.g. 128, 256, 512, 1024) |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `silent` |
 | `PREFER_LOCAL` | off | Set to `1` to use the local AutoClaw gateway first, skipping cloud attempts |
 | `TRUSTED_PROXIES` | empty | Comma-separated IPs whose `X-Forwarded-For` header is trusted for rate limiting |

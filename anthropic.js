@@ -467,7 +467,7 @@ async function handleMessages(req, res) {
   const modelId    = resolveModel(body.model);
   const stream     = body.stream === true; // Anthropic defaults to non-streaming
   const openAIBody = anthropicToOpenAI(body, modelId);
-  const payloadError = validateChatPayload(openAIBody);
+  const payloadError = validateChatPayload(openAIBody, config.MAX_MESSAGES);
   if (payloadError) {
     record(payloadError.statusCode, { error: "payload_too_large" });
     return sendErrorAnthropic(res, payloadError.message, "invalid_request_error", payloadError.statusCode, "invalid_payload");
@@ -716,6 +716,7 @@ server.listen(config.PORT, HOST, () => {
       `Port     : ${config.PORT}`,
       `Auth Key : ${config.PROXY_KEY}`,
       `Rate Lim : ${config.RATE_LIMIT} req/s per IP`,
+      `Max Msgs : ${config.MAX_MESSAGES} entries`,
       `Models   : ${MODELS.map(m => m.id).join(", ")}`,
       "",
       "Claude Code CLI Base URL:",
