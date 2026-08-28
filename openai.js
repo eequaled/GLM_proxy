@@ -409,7 +409,7 @@ server.listen(config.PORT, HOST, () => {
       `Port     : ${config.PORT}`,
       `Auth Key : ${config.PROXY_KEY}`,
       `Rate Lim : ${config.RATE_LIMIT} req/s per IP`,
-      `Max Msgs : ${config.MAX_MESSAGES} entries`,
+      `Max Msgs : ${Number.isFinite(config.MAX_MESSAGES) ? `${config.MAX_MESSAGES} entries` : "unlimited"}`,
       `Models   : ${MODELS.map(m => m.id).join(", ")}`,
       "",
       "OpenCode / OpenAI SDK Base URL:",

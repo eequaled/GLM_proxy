@@ -14,7 +14,20 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 
-const FLAGS = ["--anthropic", "--openai", "--port", "--host", "--key", "--rate-limit", "--max-messages", "--doctor", "--test-models", "--test", "--help", "-h"];
+const FLAGS = ["--anthropic", "--openai", "--port", "--host", "--key", "--rate-limit", "--max-messages", "--doctor", "--test-models", "--test", "--limit", "--help", "-h"];
+
+// Current effective MAX_MESSAGES env value as a finite number, or Infinity.
+function effectiveMaxMessages() {
+  const raw = process.env.MAX_MESSAGES;
+  if (!raw) return Infinity;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : Infinity;
+}
+
+function formatMaxMessages() {
+  const n = effectiveMaxMessages();
+  return Number.isFinite(n) ? `${n} entries` : "unlimited";
+}
 
 function showHelp() {
   console.log(`
@@ -31,13 +44,15 @@ function showHelp() {
     --host <ip>           Host to bind (default: 127.0.0.1)
     --key <string>        Authentication key for clients (default: mewmew)
     --rate-limit <n>      Max requests per second per IP (default: 30)
-    --max-messages <n>    Max message / entity limit in request (128, 256, 512, 1024; default: 128)
+    --max-messages <n>    Max message / entity limit (0/unset = unlimited; or 128, 256, 512, 1024)
+                          If you have a compression system, leaving this unlimited is preferred.
     --doctor              Live credit-tier scan of AutoClaw's catalog + routing map
     --test-models         Test all configured models against upstream and show live health
+    --limit               Set or clear the max entity / messages limit (own menu item)
     --help, -h            Show this help message
 
   Environment:
-    MAX_MESSAGES      Max messages limit per request (default: 128)
+    MAX_MESSAGES      Max messages limit per request (0/unset = unlimited; or 128, 256, 512, 1024)
     PREFER_LOCAL=1    Skip cloud attempts when the local AutoClaw gateway is up
     TRUSTED_PROXIES   Comma-separated IPs whose X-Forwarded-For header is trusted
   `);
@@ -272,6 +287,19 @@ if (args.includes("--doctor")) {
   process.exit(0);
 }
 
+// --limit: set or clear the max entity / messages limit, then exit.
+if (args.includes("--limit")) {
+  const limitIdx = args.indexOf("--limit");
+  const value = args[limitIdx + 1];
+  if (value && /^\d+$/.test(value)) {
+    const n = parseInt(value, 10);
+    process.env.MAX_MESSAGES = n > 0 ? String(n) : "";
+  }
+  console.log(`\n  Max messages: ${process.env.MAX_MESSAGES ? `${process.env.MAX_MESSAGES} entries` : `${COLORS.GREEN}unlimited${COLORS.RESET}`}`);
+  console.log(`  ${COLORS.GRAY}(If you have a compression system, leaving this unlimited is preferred.)${COLORS.RESET}\n`);
+  process.exit(0);
+}
+
 // Flag parsing
 let isAnthropic = args.includes("--anthropic");
 const portIdx = args.indexOf("--port");
@@ -293,7 +321,8 @@ if (rateLimitIdx !== -1 && args[rateLimitIdx + 1]) {
   process.env.RATE_LIMIT = args[rateLimitIdx + 1];
 }
 if (maxMessagesIdx !== -1 && args[maxMessagesIdx + 1]) {
-  process.env.MAX_MESSAGES = args[maxMessagesIdx + 1];
+  const n = parseInt(args[maxMessagesIdx + 1], 10);
+  process.env.MAX_MESSAGES = n > 0 ? String(n) : "";
 }
 
 const hasFlags = FLAGS.some((f) => args.includes(f));
@@ -306,6 +335,7 @@ if (!hasFlags && process.stdin.isTTY) {
       choices: [
         { name: "Start OpenAI Gateway (/v1/chat/completions)", value: "start_openai" },
         { name: "Start Anthropic Gateway (/v1/messages)", value: "start_anthropic" },
+        { name: "Set Max Messages Limit (default: unlimited)", value: "limit" },
         { name: "Run Model Doctor (View catalog & routing)", value: "doctor" },
         { name: "Test Models (Live proxy health check)", value: "test_models" },
       ],
@@ -333,27 +363,36 @@ if (!hasFlags && process.stdin.isTTY) {
       continue;
     }
 
+    if (action === "limit") {
+      const current = Number.isFinite(config_maxMessages())
+        ? `${config_maxMessages()} entries`
+        : `${COLORS.GREEN}unlimited${COLORS.RESET}`;
+      const entityLimit = await promptSelect({
+        message: "Max entity / messages limit:",
+        hint: `  ${COLORS.GRAY}current: ${current} — a compression system makes unlimited preferred${COLORS.RESET}`,
+        choices: [
+          { name: "Unlimited (default)", value: "unlimited" },
+          { name: "128", value: "128" },
+          { name: "256", value: "256" },
+          { name: "512", value: "512" },
+          { name: "1024", value: "1024" },
+        ],
+        default: "unlimited",
+      });
+      process.env.MAX_MESSAGES = entityLimit === "unlimited" ? "" : entityLimit;
+      console.log(`  ${COLORS.GRAY}(If you have a compression system, leaving this unlimited is preferred.)${COLORS.RESET}\n`);
+      continue;
+    }
+
     isAnthropic = action === "start_anthropic";
     const defaultPort = isAnthropic ? 18792 : 18791;
     const port = await promptNumber({ message: "Port:", default: defaultPort });
     const host = await promptInput({ message: "Host:", default: "127.0.0.1" });
     const key = await promptInput({ message: "Auth key:", default: "mewmew" });
-    const entityLimit = await promptSelect({
-      message: "Max entity / messages limit:",
-      hint: `  ${COLORS.YELLOW}(change if you got the "error code 413 / payload too large" error)${COLORS.RESET}`,
-      choices: [
-        { name: "128 (default)", value: "128" },
-        { name: "256", value: "256" },
-        { name: "512", value: "512" },
-        { name: "1024", value: "1024" },
-      ],
-      default: "128",
-    });
 
     process.env.PORT = String(port);
     process.env.HOST = host;
     process.env.PROXY_KEY = key;
-    process.env.MAX_MESSAGES = entityLimit;
     break;
   }
 }
