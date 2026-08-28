@@ -21,8 +21,8 @@ function showHelp() {
     AutoClaw Gateway CLI
   ───────────────────────────────────────────
   Usage:
-    npx autoclaw-gateway [options]
-    autoclaw-gateway [options]
+    npx glmproxy [options]
+    glmproxy [options]
 
   Options:
     --anthropic           Run in Anthropic API format (/v1/messages)

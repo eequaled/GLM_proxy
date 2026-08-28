@@ -1,4 +1,4 @@
-# AutoClaw Proxy
+# GLM Proxy
 
 <p align="center">
   <b>A lightweight local proxy that exposes AutoClaw's AI models through<br>OpenAI-compatible and Anthropic-compatible APIs.</b>
@@ -8,10 +8,12 @@
   <img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen" alt="Node.js >=18">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License MIT">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey" alt="Platform">
+  <img src="https://img.shields.io/npm/v/glmproxy" alt="npm version">
+  <img src="https://img.shields.io/npm/dm/glmproxy" alt="npm downloads">
   <img src="https://github.com/eequaled/GLM_proxy/actions/workflows/ci.yml/badge.svg" alt="CI">
 </p>
 
-> **v2.0.0** — one interactive CLI, shared core in `lib/`, zero dependencies.
+> **v2.0.0** — one interactive CLI, shared core in `lib/`, zero dependencies. Install with `npm i -g glmproxy` or run with `npx glmproxy`.
 
 ---
 
@@ -170,6 +172,48 @@ Spawns a throwaway proxy on a test port and fires a minimal prompt at **every mo
 ```
 
 The cloud verdict comes from the isolated test ring log: a `[cloud ok]` tag means the cloud served it; `[cloud NNN → local agent]` means the cloud rejected it (HTTP NNN) and AutoClaw's desktop-agent fallback answered. Zero-usage responses are the local-agent signature. The test uses isolated log files so it never clobbers your running proxy's records.
+
+## Self-hosting behind a reverse proxy
+
+The proxy binds to `127.0.0.1` by default. To run it on a server (e.g. a VPS) and expose it with TLS, bind to all interfaces and put a reverse proxy in front:
+
+```bash
+node bin/cli.js --host 0.0.0.0 --port 18791 --key change-me
+```
+
+**Caddy** (automatic HTTPS):
+
+```caddy
+glm.example.com {
+    reverse_proxy 127.0.0.1:18791
+}
+```
+
+**nginx**:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name glm.example.com;
+    # ssl_certificate / ssl_certificate_key ...
+
+    location / {
+        proxy_pass http://127.0.0.1:18791;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Host $host;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";   # keep streaming (SSE) working
+    }
+}
+```
+
+Rate limiting keys off the client IP. When proxied, pass `X-Forwarded-For` and list the proxy's address in `TRUSTED_PROXIES` (comma-separated) so the real client IP is used — otherwise every client shares one bucket:
+
+```bash
+TRUSTED_PROXIES=127.0.0.1 node bin/cli.js --host 0.0.0.0
+```
+
+> The proxy needs a logged-in AutoClaw account running on the same machine (it reads the local token file), so a public endpoint is effectively a shared account — only expose it to people you trust.
 
 ## API
 

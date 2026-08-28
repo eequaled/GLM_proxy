@@ -1,5 +1,6 @@
 *.log
 .env
+.npmrc
 proxy_requests.json
 proxy_requests_anthropic.json
 proxy_requests_test.json

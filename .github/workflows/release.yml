@@ -2,24 +2,51 @@ name: Release
 on:
   push:
     tags:
-      - v*
+      - "v*"
+  workflow_dispatch: # manual re-run without pushing a new tag
+
+permissions:
+  contents: write # create the GitHub Release
+  id-token: write # npm provenance (public repo => works out of the box)
+
 jobs:
-  release:
+  publish:
     runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }} # job env can read secrets; steps.if can read env
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
-      - run: node --check openai.js
-      - run: node --check anthropic.js
-      - run: node --check lib/core.js
-      - run: node --check bin/cli.js
-      - run: node --check main.js
-      - run: npm test
-        env:
-          RATE_LIMIT: "200"
-      - run: npm publish
-        if: ${{ secrets.NPM_TOKEN != '' }}
+          registry-url: "https://registry.npmjs.org" # creates the auth .npmrc from NODE_AUTH_TOKEN
+
+      - name: Syntax checks
+        run: node --check openai.js && node --check anthropic.js && node --check lib/core.js && node --check lib/prompts.js && node --check bin/cli.js && node --check main.js
+
+      - name: Unit tests (no upstream)
+        run: node tests/taxonomy.mjs
+
+      - name: Tag must match package.json version
+        run: |
+          PKG_VERSION=$(npm pkg get version | tr -d '"')
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::package.json is $PKG_VERSION but tag is $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+      - name: Inspect tarball
+        run: npm pack --dry-run
+
+      - name: Publish to npm
+        if: ${{ env.NPM_TOKEN != '' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance
+
+      - name: Create GitHub Release
+        if: ${{ env.NPM_TOKEN != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes
