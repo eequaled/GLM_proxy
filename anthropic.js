@@ -29,6 +29,7 @@ import {
   classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
   shouldFallbackToLocal, createPermanentFailureCache,
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
+  getClientHeaders, VERSION,
 } from "./lib/core.js";
 
 // Config (per-format log filenames come from `format`)
@@ -493,6 +494,7 @@ async function handleMessages(req, res) {
       const startedAt = Date.now();
 
       streamLocalGatewayAgent({
+        config,
         modelId,
         messages: openAIBody.messages,
         onChunk: ({ delta }) => {
@@ -587,7 +589,7 @@ async function handleMessages(req, res) {
     // Cloud call with one retry on the flaky 400 "invalid request" hiccup;
     // every >=400 body is buffered + logged (R1). Shared with openai.js.
     const { res: upstreamRes, errBody: upstreamErrBody } = await callUpstreamWithInvalidRequestRetry(
-      () => callUpstreamAnthropic(config.CLIENT_HEADERS, getToken, openAIBody, modelId),
+      () => callUpstreamAnthropic(getClientHeaders(config), getToken, openAIBody, modelId),
       modelId, permanentFailures, log,
     );
 
@@ -710,7 +712,7 @@ const HOST = process.env.HOST || "127.0.0.1";
 
 server.listen(config.PORT, HOST, () => {
   printStartupBanner({
-    title: "🛸  AUTOCLAW GATEWAY PROXY (Anthropic Format v2.5.0)",
+    title: `🛸  AUTOCLAW GATEWAY PROXY (Anthropic Format v${VERSION})`,
     rows: [
       `Host     : ${HOST}`,
       `Port     : ${config.PORT}`,

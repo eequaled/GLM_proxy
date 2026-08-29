@@ -13,7 +13,7 @@
   <img src="https://github.com/eequaled/GLM_proxy/actions/workflows/ci.yml/badge.svg" alt="CI">
 </p>
 
-> **v2.5.0** — one interactive CLI, shared core in `lib/`, zero dependencies. Install with `npm i -g glmproxy` or run with `npx glmproxy`.
+> **v2.5.1** — one interactive CLI, shared core in `lib/`, zero dependencies. Install with `npm i -g glmproxy` or run with `npx glmproxy`.
 
 ---
 
@@ -405,12 +405,13 @@ Any tool that supports OpenAI-compatible providers works. Point it at `http://lo
 ## Notes
 
 - Only one AutoClaw account can be active at a time — multi-account pooling isn't supported
-- `PROXY_KEY` is just a local password for this proxy, not your AutoClaw credentials — set it to whatever you want
+- `PROXY_KEY` is just a local password for this proxy, not your AutoClaw credentials — set it to whatever you want. The default key `mewmew` is for **localhost-only use**: change it via `--key` / `PROXY_KEY` if you bind beyond `127.0.0.1` (see [Self-hosting](#self-hosting-behind-a-reverse-proxy))
 - On a 401, the proxy invalidates its cached token and you can retry immediately
 - Upstream 400 "invalid request" gets one retry after a 2s delay (a known upstream hiccup); quota/plan errors are never retried
 - The cloud upstream requires AutoClaw's app system-prompt banner in every request. their new verification — the proxy injects it automatically (and never duplicates it). but it doesnt change much in practice/ my own testing and others testing. since it will be overridden by the harnesses own system prompt.  
 - When cloud fails, requests fall back to AutoClaw's local desktop agent (`via: "local"` in logs) unless the model just failed permanently there too
 - The token file is watched for changes — AutoClaw can rotate auth mid-session without a restart
+- AutoClaw's client identity (`X-Version` app version, platform, channel) is loaded dynamically from its runtime file — the same file that feeds the model catalog — so an AutoClaw app update is picked up without editing or restarting the proxy
 - Rate limit is enforced per client IP (default 30 req/s); X-Forwarded-For is only honored from `TRUSTED_PROXIES`
 - The ring log records cloud verdicts alongside local fallbacks, so every response is attributable
 - No dependencies at all: the interactive menu is hand-rolled on Node's built-in `readline`, so there's zero `node_modules` and zero install step

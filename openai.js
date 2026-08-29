@@ -32,7 +32,7 @@ import {
   logUpstreamErrorBody, callUpstreamWithInvalidRequestRetry,
   callUpstreamOpenAI, streamLocalGatewayAgent, getLocalGatewayToken,
   classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
-  shouldFallbackToLocal, createPermanentFailureCache,
+  shouldFallbackToLocal, createPermanentFailureCache, getClientHeaders, VERSION,
 } from "./lib/core.js";
 
 // Config
@@ -227,6 +227,7 @@ async function handleChatCompletions(req, res) {
       const startedAt = Date.now();
 
       streamLocalGatewayAgent({
+        config,
         modelId,
         messages: body.messages,
         onChunk: ({ delta }) => {
@@ -334,7 +335,7 @@ async function handleChatCompletions(req, res) {
     // Cloud call with one retry on the flaky 400 "invalid request" hiccup;
     // every >=400 body is buffered + logged (R1). Shared with anthropic.js.
     const { res: upstreamRes, errBody: upstreamErrBody } = await callUpstreamWithInvalidRequestRetry(
-      () => callUpstreamOpenAI(knownIds, config.CLIENT_HEADERS, getToken, body, modelId, log),
+      () => callUpstreamOpenAI(knownIds, getClientHeaders(config), getToken, body, modelId, log),
       modelId, permanentFailures, log,
     );
 
@@ -403,7 +404,7 @@ const HOST = process.env.HOST || "127.0.0.1";
 
 server.listen(config.PORT, HOST, () => {
   printStartupBanner({
-    title: "🛸  AUTOCLAW GATEWAY PROXY (OpenAI Format v2.5.0)",
+    title: `🛸  AUTOCLAW GATEWAY PROXY (OpenAI Format v${VERSION})`,
     rows: [
       `Host     : ${HOST}`,
       `Port     : ${config.PORT}`,
