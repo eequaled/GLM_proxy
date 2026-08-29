@@ -403,7 +403,7 @@ const HOST = process.env.HOST || "127.0.0.1";
 
 server.listen(config.PORT, HOST, () => {
   printStartupBanner({
-    title: "🛸  AUTOCLAW GATEWAY PROXY (OpenAI Format v2.0.0)",
+    title: "🛸  AUTOCLAW GATEWAY PROXY (OpenAI Format v2.5.0)",
     rows: [
       `Host     : ${HOST}`,
       `Port     : ${config.PORT}`,

@@ -13,7 +13,7 @@
   <img src="https://github.com/eequaled/GLM_proxy/actions/workflows/ci.yml/badge.svg" alt="CI">
 </p>
 
-> **v2.0.0** — one interactive CLI, shared core in `lib/`, zero dependencies. Install with `npm i -g glmproxy` or run with `npx glmproxy`.
+> **v2.5.0** — one interactive CLI, shared core in `lib/`, zero dependencies. Install with `npm i -g glmproxy` or run with `npx glmproxy`.
 
 ---
 
