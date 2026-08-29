@@ -10,6 +10,7 @@ import {
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
   getLocalGatewayToken, COLORS,
 } from "../lib/core.js";
+import { DEFAULT_PORTS, DEFAULT_HOST, DEFAULT_PROXY_KEY, TEST_PROXY_PORT } from "../lib/constants.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -40,9 +41,9 @@ function showHelp() {
   Options:
     --anthropic           Run in Anthropic API format (/v1/messages)
     --openai              Run in OpenAI API format (/v1/chat/completions) [default]
-    --port <number>       Port to listen on (default: 18791 for OpenAI, 18792 for Anthropic)
-    --host <ip>           Host to bind (default: 127.0.0.1)
-    --key <string>        Authentication key for clients (default: mewmew)
+    --port <number>       Port to listen on (default: ${DEFAULT_PORTS.openai} for OpenAI, ${DEFAULT_PORTS.anthropic} for Anthropic)
+    --host <ip>           Host to bind (default: ${DEFAULT_HOST})
+    --key <string>        Authentication key for clients (default: ${DEFAULT_PROXY_KEY})
     --rate-limit <n>      Max requests per second per IP (default: 30)
     --max-messages <n>    Max message / entity limit (0/unset = unlimited; or 128, 256, 512, 1024)
                           If you have a compression system, leaving this unlimited is preferred.
@@ -87,7 +88,7 @@ function readTestRing(filePath, sinceTs) {
 }
 
 async function runModelTests() {
-  const config = loadConfig({ defaultPort: 18791 });
+  const config = loadConfig({ format: "openai" });
   const catalog = getModelCatalog(config);
 
   console.log(`\n  🧪  AutoClaw Model Health Test`);
@@ -95,7 +96,7 @@ async function runModelTests() {
 
   // Spin up a temporary proxy on a test port so requests go through
   // the full pipeline (cloud upstream → local gateway fallback).
-  const testPort = 19799;
+  const testPort = TEST_PROXY_PORT;
   const testKey = "model-test-" + Date.now();
 
   // Isolated log files: without these, the spawned child's read-modify-write
@@ -226,7 +227,7 @@ async function runModelTests() {
 // fallback, routed through the SAME annotate/resolve pair the Anthropic
 // entrypoint uses. No duplicated fragment matching here anymore.
 async function runDoctor() {
-  const config = loadConfig({ defaultPort: 18791 });
+  const config = loadConfig({ format: "openai" });
   const catalog = getModelCatalog(config);
 
   console.log(`\n  AutoClaw model doctor`);
@@ -385,7 +386,7 @@ if (!hasFlags && process.stdin.isTTY) {
     }
 
     isAnthropic = action === "start_anthropic";
-    const defaultPort = isAnthropic ? 18792 : 18791;
+    const defaultPort = DEFAULT_PORTS[isAnthropic ? "anthropic" : "openai"];
     const port = await promptNumber({ message: "Port:", default: defaultPort });
     const host = await promptInput({ message: "Host:", default: "127.0.0.1" });
     const key = await promptInput({ message: "Auth key:", default: "mewmew" });

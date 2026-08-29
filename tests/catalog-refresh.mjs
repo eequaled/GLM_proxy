@@ -12,7 +12,7 @@ const key = "catalog-refresh-key";
 const testHome = fs.mkdtempSync(path.join(os.tmpdir(), "autoclaw-catalog-refresh-"));
 const runtimeDir = path.join(testHome, ".openclaw-autoclaw");
 const runtimeFile = path.join(runtimeDir, "openclaw.runtime.json");
-const port = 19000 + Math.floor(Math.random() * 1000);
+const port = 20000 + Math.floor(Math.random() * 1000); // stay clear of the reserved 1879x/19799/1989x range
 
 function writeCatalog(id) {
   fs.mkdirSync(runtimeDir, { recursive: true });

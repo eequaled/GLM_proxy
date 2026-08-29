@@ -1,6 +1,7 @@
 import { startProxy, stopProxy, post, check, summary } from "./_helpers.mjs";
+import { PEN_TEST_PORTS } from "../lib/constants.js";
 
-const PORT = 19892;
+const PORT = PEN_TEST_PORTS.p2;
 const proxy = await startProxy(PORT);
 const valid = { model: "test", messages: [{ role: "user", content: "hi" }] };
 

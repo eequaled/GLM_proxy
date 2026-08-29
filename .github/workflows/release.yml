@@ -28,6 +28,7 @@ jobs:
         run: node tests/taxonomy.mjs
 
       - name: Tag must match package.json version
+        if: ${{ github.event_name == 'push' }} # only tag pushes; manual runs publish whatever version is in package.json
         run: |
           PKG_VERSION=$(npm pkg get version | tr -d '"')
           TAG_VERSION="${GITHUB_REF_NAME#v}"

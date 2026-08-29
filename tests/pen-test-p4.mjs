@@ -1,6 +1,7 @@
 import { startProxy, stopProxy, post, check, summary } from "./_helpers.mjs";
+import { PEN_TEST_PORTS } from "../lib/constants.js";
 
-const PORT = 19894;
+const PORT = PEN_TEST_PORTS.p4;
 const proxy = await startProxy(PORT, { MAX_BODY_BYTES: String(1024 * 1024) });
 const ok = (r) => r.status === 400 || r.status === 413;
 

@@ -33,7 +33,7 @@ import {
 } from "./lib/core.js";
 
 // Config (per-format log filenames come from `format`)
-const config = loadConfig({ defaultPort: 18792, format: "anthropic" });
+const config = loadConfig({ format: "anthropic" });
 const { log } = createLogger(config.LOG_LEVEL);
 const { MODELS } = loadModelCatalog(config);
 const { getToken, invalidateToken, startWatch } = createTokenLayer(config, log);
@@ -589,7 +589,7 @@ async function handleMessages(req, res) {
     // Cloud call with one retry on the flaky 400 "invalid request" hiccup;
     // every >=400 body is buffered + logged (R1). Shared with openai.js.
     const { res: upstreamRes, errBody: upstreamErrBody } = await callUpstreamWithInvalidRequestRetry(
-      () => callUpstreamAnthropic(getClientHeaders(config), getToken, openAIBody, modelId),
+      () => callUpstreamAnthropic(config, getClientHeaders(config), getToken, openAIBody, modelId),
       modelId, permanentFailures, log,
     );
 
@@ -708,13 +708,11 @@ const server = createGatewayServer({
 
 installProcessGuards(log);
 
-const HOST = process.env.HOST || "127.0.0.1";
-
-server.listen(config.PORT, HOST, () => {
+server.listen(config.PORT, config.HOST, () => {
   printStartupBanner({
     title: `🛸  AUTOCLAW GATEWAY PROXY (Anthropic Format v${VERSION})`,
     rows: [
-      `Host     : ${HOST}`,
+      `Host     : ${config.HOST}`,
       `Port     : ${config.PORT}`,
       `Auth Key : ${config.PROXY_KEY}`,
       `Rate Lim : ${config.RATE_LIMIT} req/s per IP`,
@@ -722,7 +720,7 @@ server.listen(config.PORT, HOST, () => {
       `Models   : ${MODELS.map(m => m.id).join(", ")}`,
       "",
       "Claude Code CLI Base URL:",
-      `http://${HOST}:${config.PORT}`,
+      `http://${config.HOST}:${config.PORT}`,
       `Routing  : opus→${tierTargets.opus} sonnet→${tierTargets.sonnet} haiku→${tierTargets.haiku}`,
     ],
   });

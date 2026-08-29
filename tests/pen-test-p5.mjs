@@ -1,10 +1,11 @@
 import { startProxy, stopProxy, post, check, summary } from "./_helpers.mjs";
+import { PEN_TEST_PORTS } from "../lib/constants.js";
 import { readFileSync, existsSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PORT = 19895;
+const PORT = PEN_TEST_PORTS.p5;
 const JSONL_PATH = path.join(ROOT, "test_requests.jsonl");
 // clean up any leftover from previous runs
 try { unlinkSync(JSONL_PATH); } catch {}

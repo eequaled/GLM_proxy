@@ -36,7 +36,7 @@ import {
 } from "./lib/core.js";
 
 // Config
-const config = loadConfig({ defaultPort: 18791, format: "openai" });
+const config = loadConfig({ format: "openai" });
 const { log } = createLogger(config.LOG_LEVEL);
 const { MODELS } = loadModelCatalog(config);
 const { getToken, invalidateToken, startWatch } = createTokenLayer(config, log);
@@ -335,7 +335,7 @@ async function handleChatCompletions(req, res) {
     // Cloud call with one retry on the flaky 400 "invalid request" hiccup;
     // every >=400 body is buffered + logged (R1). Shared with anthropic.js.
     const { res: upstreamRes, errBody: upstreamErrBody } = await callUpstreamWithInvalidRequestRetry(
-      () => callUpstreamOpenAI(knownIds, getClientHeaders(config), getToken, body, modelId, log),
+      () => callUpstreamOpenAI(config, knownIds, getClientHeaders(config), getToken, body, modelId, log),
       modelId, permanentFailures, log,
     );
 
@@ -400,13 +400,11 @@ const server = createGatewayServer({
 
 installProcessGuards(log);
 
-const HOST = process.env.HOST || "127.0.0.1";
-
-server.listen(config.PORT, HOST, () => {
+server.listen(config.PORT, config.HOST, () => {
   printStartupBanner({
     title: `🛸  AUTOCLAW GATEWAY PROXY (OpenAI Format v${VERSION})`,
     rows: [
-      `Host     : ${HOST}`,
+      `Host     : ${config.HOST}`,
       `Port     : ${config.PORT}`,
       `Auth Key : ${config.PROXY_KEY}`,
       `Rate Lim : ${config.RATE_LIMIT} req/s per IP`,
@@ -414,7 +412,7 @@ server.listen(config.PORT, HOST, () => {
       `Models   : ${MODELS.map(m => m.id).join(", ")}`,
       "",
       "OpenCode / OpenAI SDK Base URL:",
-      `http://${HOST}:${config.PORT}/v1`,
+      `http://${config.HOST}:${config.PORT}/v1`,
     ],
   });
 

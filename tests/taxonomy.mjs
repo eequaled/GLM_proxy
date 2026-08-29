@@ -1,7 +1,11 @@
 // Unit tests for the shared error taxonomy and credit-tier routing.
 // Pure functions only — no network, no spawned proxies.
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
+  loadConfig,
   classifyUpstreamError,
   classifyLocalAgentError,
   classifyTransportError,
@@ -238,6 +242,38 @@ check("resolveUpstreamModelId keeps known ids, maps auto, prefixes others", () =
   assert.equal(resolveUpstreamModelId(known, "zai_auto"), "zai_auto");
   assert.equal(resolveUpstreamModelId(known, "auto"), "zai_auto");
   assert.equal(resolveUpstreamModelId(known, "glm-5.3"), "zai_glm-5.3");
+});
+
+// ── Fallback model catalog ─────────────────────────────────────────────────
+
+check("fallback catalog ships six models incl glm-5.3-flash", () => {
+  const cfg = loadConfig({ format: "openai" });
+  assert.ok(Array.isArray(cfg.FALLBACK_MODELS) && cfg.FALLBACK_MODELS.length === 6);
+  assert.ok(cfg.FALLBACK_MODELS.some((m) => m.id === "zai_glm-5.3-flash"));
+});
+
+check("FALLBACK_MODELS_PATH override is honored", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "glmproxy-fb-"));
+  fs.writeFileSync(path.join(tmp, "models.json"), JSON.stringify({ models: [{ id: "custom-model", name: "Custom" }] }));
+  process.env.FALLBACK_MODELS_PATH = path.join(tmp, "models.json");
+  try {
+    const cfg = loadConfig({ format: "openai" });
+    assert.equal(cfg.FALLBACK_MODELS.length, 1);
+    assert.equal(cfg.FALLBACK_MODELS[0].id, "custom-model");
+  } finally {
+    delete process.env.FALLBACK_MODELS_PATH;
+  }
+});
+
+check("malformed FALLBACK_MODELS_PATH degrades to built-ins", () => {
+  process.env.FALLBACK_MODELS_PATH = "C:/definitely/not/here.json";
+  try {
+    const cfg = loadConfig({ format: "openai" });
+    assert.ok(cfg.FALLBACK_MODELS.length >= 5);
+    assert.ok(cfg.FALLBACK_MODELS.every((m) => typeof m.id === "string"));
+  } finally {
+    delete process.env.FALLBACK_MODELS_PATH;
+  }
 });
 
 console.log(`\n  ${passed}/${passed + failed} passed`);

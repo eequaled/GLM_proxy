@@ -129,6 +129,11 @@ They read the same env vars and respect `HOST`, `PORT`, `PROXY_KEY`, `RATE_LIMIT
 | `JSONL_LOG` | off | Write structured JSONL request log when `true` |
 | `JSONL_FILE` | `proxy_requests.jsonl` (Anthropic: `proxy_requests_anthropic.jsonl`) | JSONL output path |
 | `JSONL_MAX_BYTES` | `10485760` | Rotate JSONL log when it exceeds this (10 MB) |
+| `UPSTREAM_TIMEOUT_MS` | `120000` | Per-attempt upstream budget (idle-based; the vendor allows up to 20 min — raise this for slow thinking models) |
+| `GATEWAY_MIN_PROTOCOL` / `GATEWAY_MAX_PROTOCOL` | `3` / `4` | Local-gateway WS protocol range offered on connect (the proxy self-heals to the gateway's expected protocol on mismatch) |
+| `LOCAL_GATEWAY_HOST` / `LOCAL_GATEWAY_PORT` | `127.0.0.1` / `18789` | Where the AutoClaw desktop gateway is expected |
+| `FALLBACK_MODELS_PATH` | empty | Path to an external fallback model catalog JSON (`{"models":[...]}`) — defaults to the shipped `lib/fallback-models.json` |
+| `AUTOCLAW_SYSTEM_BANNER` | built-in | Override the system-prompt banner injected into cloud requests (keep the `## Tooling` line intact) |
 | `--anthropic` | — | Run in Anthropic API format |
 | `--openai` | — | Run in OpenAI API format (default) |
 | `--doctor` | — | Scan AutoClaw's current runtime model catalog and show Anthropic routing |
@@ -300,7 +305,7 @@ When the cloud upstream fails (and it's not a plain 404/429), the proxy re-runs 
 | `zai_auto` | Auto | 1M | 393K | Routes to AutoClaw's optimal model |
 | `zaicoding_glm-5.3` | GLM-5.3 | 1M | 307K | Latest GLM coding model |
 | `zai_glm-5-turbo` | GLM-5-Turbo | 200K | 131K | Zhipu AI GLM-5 Turbo |
-| `zai_glm-5.3-flash` | GLM-5.3-Flash ("OX-alpha") | — | — | Newest GLM flash model. Not in AutoClaw's cloud catalog yet: the cloud upstream 400s it, so it's served via the local-agent fallback only, and won't appear in `/v1/models` until AutoClaw's catalog includes it |
+| `zai_glm-5.3-flash` | GLM-5.3-Flash ("OX-alpha") | 1M | 131K | Newest GLM flash model. The cloud upstream 400s it, so it's served via the local-agent fallback; it now appears in `/v1/models` and in the built-in fallback catalog |
 | `tdpsk_deepseek-v4-flash-202605` | Deepseek-V4-Flash | 1M | 393K | Fast DeepSeek model |
 | `tdpsk_deepseek-v4-pro-202606` | DeepSeek-V4-Pro | 1M | 393K | Deep reasoning model |
 
@@ -413,6 +418,8 @@ Any tool that supports OpenAI-compatible providers works. Point it at `http://lo
 - The token file is watched for changes — AutoClaw can rotate auth mid-session without a restart
 - AutoClaw's client identity (`X-Version` app version, platform, channel) is loaded dynamically from its runtime file — the same file that feeds the model catalog — so an AutoClaw app update is picked up without editing or restarting the proxy
 - Rate limit is enforced per client IP (default 30 req/s); X-Forwarded-For is only honored from `TRUSTED_PROXIES`
+- The fallback model catalog lives in `lib/fallback-models.json` (override with `FALLBACK_MODELS_PATH`) — the built-in list is only a last resort when AutoClaw's runtime file is unreadable
+- The local-gateway connect self-heals: if the gateway bumps its WS protocol, the proxy reconnects with the expected version automatically
 - The ring log records cloud verdicts alongside local fallbacks, so every response is attributable
 - No dependencies at all: the interactive menu is hand-rolled on Node's built-in `readline`, so there's zero `node_modules` and zero install step
 
