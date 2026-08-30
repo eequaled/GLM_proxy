@@ -5,8 +5,8 @@
   "main": "openai.js",
   "type": "module",
   "bin": {
-    "glmproxy": "./bin/cli.js",
-    "glm-proxy": "./bin/cli.js"
+    "glmproxy": "bin/cli.js",
+    "glm-proxy": "bin/cli.js"
   },
   "files": [
     "openai.js",
