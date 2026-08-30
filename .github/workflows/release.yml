@@ -60,8 +60,10 @@ jobs:
       # provenance is generated automatically. Configured on npmjs.com under
       # Package settings → Trusted Publisher (repo: eequaled/GLM_proxy,
       # workflow: release.yml, action: npm publish).
+      # --loglevel verbose surfaces the OIDC exchange rejection reason (the
+      # oidc module logs it at verbose; ENEEDAUTH alone is misleading).
       - name: Publish to npm
-        run: npm publish
+        run: npm publish --loglevel verbose
 
       - name: Create GitHub Release
         env:
