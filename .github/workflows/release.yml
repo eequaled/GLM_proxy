@@ -12,6 +12,9 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+      id-token: write # trusted publishing (OIDC): npm authenticates the workflow, no token needed
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v6
@@ -25,6 +28,13 @@ jobs:
       # force a current one before publishing.
       - name: Upgrade npm for OIDC trusted publishing
         run: npm i -g npm@latest
+
+      - name: OIDC environment check
+        run: |
+          npm --version
+          echo "oidc_url=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo present || echo MISSING)"
+          echo "oidc_token=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] && echo present || echo MISSING)"
+          echo "gha=${GITHUB_ACTIONS:-unset}"
 
       - name: Syntax checks
         run: node --check openai.js && node --check anthropic.js && node --check lib/core.js && node --check lib/prompts.js && node --check bin/cli.js && node --check main.js
