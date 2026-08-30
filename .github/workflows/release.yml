@@ -7,19 +7,17 @@ on:
 
 permissions:
   contents: write # create the GitHub Release
-  id-token: write # npm provenance (public repo => works out of the box)
+  id-token: write # trusted publishing (OIDC): npm authenticates the workflow, no token needed
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    env:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }} # job env can read secrets; steps.if can read env
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v6
         with:
-          node-version: 20
-          registry-url: "https://registry.npmjs.org" # creates the auth .npmrc from NODE_AUTH_TOKEN
+          node-version: 24 # npm 11.5.1+ required for trusted publishing (OIDC)
+          registry-url: "https://registry.npmjs.org"
 
       - name: Syntax checks
         run: node --check openai.js && node --check anthropic.js && node --check lib/core.js && node --check lib/prompts.js && node --check bin/cli.js && node --check main.js
@@ -40,14 +38,15 @@ jobs:
       - name: Inspect tarball
         run: npm pack --dry-run
 
+      # Trusted publishing: npm exchanges the workflow's OIDC token for a
+      # short-lived publish credential — no NPM_TOKEN secret, no OTP, and
+      # provenance is generated automatically. Configured on npmjs.com under
+      # Package settings → Trusted Publisher (repo: eequaled/GLM_proxy,
+      # workflow: release.yml, action: npm publish).
       - name: Publish to npm
-        if: ${{ env.NPM_TOKEN != '' }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance
+        run: npm publish
 
       - name: Create GitHub Release
-        if: ${{ env.NPM_TOKEN != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" --generate-notes
