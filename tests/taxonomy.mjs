@@ -15,6 +15,7 @@ import {
   annotateCreditTiers,
   resolveTierTargets,
   resolveUpstreamModelId,
+  translateUpstreamError,
 } from "../lib/core.js";
 
 let passed = 0;
@@ -274,6 +275,20 @@ check("malformed FALLBACK_MODELS_PATH degrades to built-ins", () => {
   } finally {
     delete process.env.FALLBACK_MODELS_PATH;
   }
+});
+
+// ── Account ban (403 + code 410004) ─────────────────────────────────────────
+
+check("403 + 410004 banned body → permanent 403 account_banned", () => {
+  const c = classifyUpstreamError(403, '{"code":410004,"message":"账号已被封禁"}', "zai_auto");
+  assert.equal(c.status, 403);
+  assert.equal(c.code, "account_banned");
+  assert.equal(c.permanent, true);
+  assert.match(c.message, /Account banned/);
+});
+
+check("账号已被封禁 translates to English", () => {
+  assert.equal(translateUpstreamError("账号已被封禁"), "Account banned by AutoClaw");
 });
 
 console.log(`\n  ${passed}/${passed + failed} passed`);

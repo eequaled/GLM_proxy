@@ -16,8 +16,15 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v6
         with:
-          node-version: 24 # npm 11.5.1+ required for trusted publishing (OIDC)
-          registry-url: "https://registry.npmjs.org"
+          node-version: 24
+          # no registry-url on purpose: OIDC trusted publishing needs no .npmrc
+          # and a leftover auth token env makes npm skip the OIDC handshake
+
+      # npm < 11.5.1 silently fails the OIDC token exchange and reports a
+      # misleading 404 (npm/cli#9088). The runner's bundled npm can be older —
+      # force a current one before publishing.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm i -g npm@latest
 
       - name: Syntax checks
         run: node --check openai.js && node --check anthropic.js && node --check lib/core.js && node --check lib/prompts.js && node --check bin/cli.js && node --check main.js
