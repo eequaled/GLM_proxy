@@ -158,8 +158,8 @@ AutoClaw handles authentication automatically. When the cloud path fails, reques
 
 | ID | Name | Context | Max Output | Notes |
 |----|------|---------|------------|-------|
-| `zai_auto` | Auto | 1M | 393K | Routes to AutoClaw's optimal model |
-| `zaicoding_glm-5.3` | GLM-5.3 | 1M | 307K | Latest GLM coding model |
+| `zai_auto` | Auto | 1M | 131K | Routes to AutoClaw's optimal model (GLM-5.3-Flash today) |
+| `zaicoding_glm-5.3` | GLM-5.3 | 1M | 131K | Latest GLM coding model |
 | `zai_glm-5-turbo` | GLM-5-Turbo | 200K | 131K | Zhipu AI GLM-5 Turbo |
 | `zai_glm-5.3-flash` | GLM-5.3-Flash ("OX-alpha") | 1M | 131K | Now a regular catalog model, served straight through the cloud path |
 | `tdpsk_deepseek-v4-flash-202605` | Deepseek-V4-Flash | 1M | 393K | Fast DeepSeek model |
@@ -386,6 +386,7 @@ TRUSTED_PROXIES=127.0.0.1 glmproxy --host 0.0.0.0
 - On a 401, the proxy invalidates its cached token and you can retry immediately
 - Upstream 400 `"invalid request"` gets one retry after a 2s delay (a known upstream hiccup). Quota/plan errors are never retried
 - The cloud upstream requires AutoClaw's app system-prompt banner in every request. The proxy injects it automatically and never duplicates it. In practice it doesn't change much since your harness's own system prompt overrides it anyway
+- Max output is clamped to each model's real upstream cap (131K for every GLM model, 393K for DeepSeek). AutoClaw's runtime catalog overstates GLM-5.3's cap (307K), and asking the cloud for more than a model's real cap makes it **silently run a DeepSeek model instead and bill DeepSeek credits** — the proxy clamps so your `zai_glm-5.3` stays GLM-5.3
 - The token file is watched for changes, so AutoClaw can rotate auth mid-session without a restart
 - AutoClaw's client identity (app version, platform, channel) loads dynamically from its runtime file, same as the model catalog, so an AutoClaw app update is picked up without editing or restarting the proxy
 - The fallback model catalog lives in `lib/fallback-models.json` (override with `FALLBACK_MODELS_PATH`). The built-in list is only a last resort when AutoClaw's runtime file is unreadable

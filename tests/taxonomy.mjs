@@ -16,6 +16,8 @@ import {
   resolveTierTargets,
   resolveUpstreamModelId,
   translateUpstreamError,
+  clampMaxOutput,
+  OUTPUT_CAPS,
 } from "../lib/core.js";
 
 let passed = 0;
@@ -289,6 +291,36 @@ check("403 + 410004 banned body → permanent 403 account_banned", () => {
 
 check("账号已被封禁 translates to English", () => {
   assert.equal(translateUpstreamError("账号已被封禁"), "Account banned by AutoClaw");
+});
+
+// ── Max-output clamp (upstream silently swaps to deepseek when exceeded) ─────
+
+check("every GLM model clamps to the real 131072 cap", () => {
+  for (const id of ["zaicoding_glm-5.3", "zai_glm-5.3-flash", "zai_glm-5-turbo", "zai_auto"]) {
+    assert.equal(clampMaxOutput(id, 393_216), 131_072, `${id} should clamp 393216 → 131072`);
+    assert.equal(clampMaxOutput(id, 131_072), 131_072, `${id} at-cap passes through`);
+    assert.equal(clampMaxOutput(id, 131_073), 131_072, `${id} one-over clamps`);
+  }
+});
+
+check("deepseek models keep their 393216 cap", () => {
+  for (const id of ["tdpsk_deepseek-v4-flash-202605", "tdpsk_deepseek-v4-pro-202606"]) {
+    assert.equal(clampMaxOutput(id, 393_216), 393_216);
+    assert.equal(clampMaxOutput(id, 500_000), 393_216);
+  }
+});
+
+check("unknown models and absent values pass through untouched", () => {
+  assert.equal(clampMaxOutput("mystery-model", 500_000), 500_000);
+  assert.equal(clampMaxOutput("zai_auto", undefined), undefined);
+  assert.equal(clampMaxOutput("zai_auto", null), null);
+});
+
+check("catalog claims never exceed the verified output caps", () => {
+  const cfg = loadConfig({ format: "openai" });
+  for (const m of cfg.FALLBACK_MODELS) {
+    if (OUTPUT_CAPS[m.id]) assert.ok(m.maxTokens <= OUTPUT_CAPS[m.id], `${m.id} maxTokens ${m.maxTokens} > cap ${OUTPUT_CAPS[m.id]}`);
+  }
 });
 
 console.log(`\n  ${passed}/${passed + failed} passed`);
