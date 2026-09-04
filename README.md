@@ -250,6 +250,9 @@ glmproxy --test-models
 | `PREFER_LOCAL` | off | Set to `1` to use the local AutoClaw gateway first, skipping cloud attempts |
 | `TRUSTED_PROXIES` | empty | Comma-separated IPs whose `X-Forwarded-For` header is trusted for rate limiting |
 | `MAX_BODY_BYTES` | `52428800` | Max request body (50 MB) |
+| `MAX_MESSAGE_TEXT_BYTES` | `262144` | Max per-message TEXT size (256 KB; base64 image data is not counted as text) |
+| `MAX_TOTAL_MESSAGE_TEXT_BYTES` | `1048576` | Max combined message text (1 MB) |
+| `MAX_IMAGE_BYTES` | `20971520` | Max decoded size per image attachment (20 MB) |
 | `JSONL_LOG` | off | Write structured JSONL request log when `true` (also on with `LOG_LEVEL=debug`) |
 | `JSONL_FILE` | `proxy_requests.jsonl` (Anthropic: `proxy_requests_anthropic.jsonl`) | JSONL output path |
 | `JSONL_SYNC` | off | Write JSONL lines synchronously when `true` (flush every line) |
@@ -264,6 +267,7 @@ glmproxy --test-models
 | `--limit [n]` | — | Set or clear the max message/entity limit (e.g. `--limit 256`; bare `--limit` prints the current value) |
 | `--doctor` | — | Scan AutoClaw's current runtime model catalog and show Anthropic routing |
 | `--test-models` / `--test` | — | Live health check: test every catalog model through the full pipeline |
+| `--stop` | — | Kill any other running glmproxy instances (npm-global or `bin/cli.js` starts) and exit |
 | `--help`, `-h` | — | Show CLI help |
 
 **JSONL request logging.** Set `JSONL_LOG=true` (or `LOG_LEVEL=debug`) to write one JSON line per request:
@@ -387,6 +391,7 @@ TRUSTED_PROXIES=127.0.0.1 glmproxy --host 0.0.0.0
 - Upstream 400 `"invalid request"` gets one retry after a 2s delay (a known upstream hiccup). Quota/plan errors are never retried
 - The cloud upstream requires AutoClaw's app system-prompt banner in every request. The proxy injects it automatically and never duplicates it. In practice it doesn't change much since your harness's own system prompt overrides it anyway
 - Max output is clamped to each model's real upstream cap (131K for every GLM model, 393K for DeepSeek). AutoClaw's runtime catalog overstates GLM-5.3's cap (307K), and asking the cloud for more than a model's real cap makes it **silently run a DeepSeek model instead and bill DeepSeek credits** — the proxy clamps so your `zai_glm-5.3` stays GLM-5.3
+- Images pass through natively: pasted/attached images (`image_url` data URLs, Anthropic `image` blocks) reach vision-capable models (e.g. `zai_glm-5.3-flash`) as real image parts — the model sees them directly, no OCR bridge. Text-only models reject them upstream and the request falls back to the desktop agent, mirroring AutoClaw's own gating
 - The token file is watched for changes, so AutoClaw can rotate auth mid-session without a restart
 - AutoClaw's client identity (app version, platform, channel) loads dynamically from its runtime file, same as the model catalog, so an AutoClaw app update is picked up without editing or restarting the proxy
 - The fallback model catalog lives in `lib/fallback-models.json` (override with `FALLBACK_MODELS_PATH`). The built-in list is only a last resort when AutoClaw's runtime file is unreadable

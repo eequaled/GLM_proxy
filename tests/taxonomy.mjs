@@ -18,6 +18,8 @@ import {
   translateUpstreamError,
   clampMaxOutput,
   OUTPUT_CAPS,
+  validateChatPayload,
+  normalizeClientMessages,
 } from "../lib/core.js";
 
 let passed = 0;
@@ -321,6 +323,62 @@ check("catalog claims never exceed the verified output caps", () => {
   for (const m of cfg.FALLBACK_MODELS) {
     if (OUTPUT_CAPS[m.id]) assert.ok(m.maxTokens <= OUTPUT_CAPS[m.id], `${m.id} maxTokens ${m.maxTokens} > cap ${OUTPUT_CAPS[m.id]}`);
   }
+});
+
+// ── Image payload handling (native vision passthrough) ──────────────────────
+
+const dataUrl = (bytes) => `data:image/png;base64,${"A".repeat(Math.ceil((bytes * 4) / 3))}`;
+const imgMsg = (bytes) => ({
+  model: "zai_glm-5.3-flash",
+  messages: [{ role: "user", content: [
+    { type: "text", text: "What do you see?" },
+    { type: "image_url", image_url: { url: dataUrl(bytes) } },
+  ] }],
+});
+
+check("a 400KB image attachment does NOT trip the per-message text cap", () => {
+  assert.equal(validateChatPayload(imgMsg(400 * 1024)), null);
+});
+
+check("oversized plain text still 413s", () => {
+  const body = { messages: [{ role: "user", content: "x".repeat(300 * 1024) }] };
+  const err = validateChatPayload(body);
+  assert.equal(err?.statusCode, 413);
+  assert.match(err.message, /individual message/);
+});
+
+check("image over MAX_IMAGE_BYTES 413s with a dedicated message", () => {
+  process.env.MAX_IMAGE_BYTES = "1000";
+  try {
+    const err = validateChatPayload(imgMsg(50 * 1024));
+    assert.equal(err?.statusCode, 413);
+    assert.match(err.message, /image attachment/);
+  } finally { delete process.env.MAX_IMAGE_BYTES; }
+});
+
+check("text inside multimodal arrays counts toward the text caps", () => {
+  const body = { messages: [{ role: "user", content: [
+    { type: "text", text: "x".repeat(300 * 1024) },
+    { type: "image_url", image_url: { url: dataUrl(1024) } },
+  ] }] };
+  const err = validateChatPayload(body);
+  assert.equal(err?.statusCode, 413);
+});
+
+check("normalizeClientMessages flattens all-text arrays but preserves images", () => {
+  const out = normalizeClientMessages({ messages: [
+    { role: "user", content: [{ type: "text", text: "hello " }, { type: "text", text: "world" }] },
+    { role: "user", content: [
+      { type: "text", text: "look" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+    ] },
+    { role: "developer", content: "behave" },
+  ] });
+  assert.equal(out[0].content, "hello \nworld");
+  assert.ok(Array.isArray(out[1].content), "multimodal content must stay an array");
+  assert.equal(out[1].content[1].type, "image_url");
+  assert.equal(out[1].content[1].image_url.url, "data:image/png;base64,AAAA");
+  assert.equal(out[2].role, "system");
 });
 
 console.log(`\n  ${passed}/${passed + failed} passed`);

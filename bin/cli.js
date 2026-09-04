@@ -5,6 +5,7 @@ import fs from "fs";
 import { fileURLToPath, pathToFileURL } from "url";
 import { promptSelect, promptInput, promptNumber } from "../lib/prompts.js";
 import http from "http";
+import { spawnSync } from "child_process";
 import {
   getModelCatalog, loadConfig, createTokenLayer,
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
@@ -15,7 +16,7 @@ import { DEFAULT_PORTS, DEFAULT_HOST, DEFAULT_PROXY_KEY, TEST_PROXY_PORT } from 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 
-const FLAGS = ["--anthropic", "--openai", "--port", "--host", "--key", "--rate-limit", "--max-messages", "--doctor", "--test-models", "--test", "--limit", "--help", "-h"];
+const FLAGS = ["--anthropic", "--openai", "--port", "--host", "--key", "--rate-limit", "--max-messages", "--doctor", "--test-models", "--test", "--limit", "--stop", "--help", "-h"];
 
 // Current effective MAX_MESSAGES env value as a finite number, or Infinity.
 function effectiveMaxMessages() {
@@ -49,6 +50,7 @@ function showHelp() {
                           If you have a compression system, leaving this unlimited is preferred.
     --doctor              Live credit-tier scan of AutoClaw's catalog + routing map
     --test-models         Test all configured models against upstream and show live health
+    --stop                Kill any other running glmproxy instances and exit
     --limit               Set or clear the max entity / messages limit (own menu item)
     --help, -h            Show this help message
 
@@ -285,6 +287,70 @@ if (args.includes("--test-models") || args.includes("--test")) {
 
 if (args.includes("--doctor")) {
   await runDoctor();
+  process.exit(0);
+}
+
+// ─── --stop / stop: kill other running glmproxy instances ───────────────────
+// Matches processes whose command line mentions glmproxy AND cli.js (covers
+// npm-global installs and repo checkouts started via bin/cli.js) while never
+// matching this very process. Dev entrypoints launched as `node openai.js`
+// carry no glmproxy marker — stop those by hand.
+function findGlmproxyInstances() {
+  const selfPid = process.pid;
+  const hits = [];
+  if (process.platform === "win32") {
+    const res = spawnSync("powershell", ["-NoProfile", "-Command",
+      `Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^node' -and $_.CommandLine -match 'glmproxy' -and $_.CommandLine -match 'cli\\.js' } | ForEach-Object { "$($_.ProcessId)|$($_.CommandLine)" }`,
+    ], { encoding: "utf8", windowsHide: true });
+    for (const line of (res.stdout || "").split(/\r?\n/)) {
+      const idx = line.indexOf("|");
+      if (idx <= 0) continue;
+      const pid = Number.parseInt(line.slice(0, idx), 10);
+      const cmd = line.slice(idx + 1);
+      if (Number.isInteger(pid) && pid > 0 && pid !== selfPid) hits.push({ pid, cmd });
+    }
+  } else {
+    const res = spawnSync("ps", ["-eo", "pid=,command="], { encoding: "utf8" });
+    for (const line of (res.stdout || "").split("\n")) {
+      const m = line.match(/^\s*(\d+)\s+(.+)$/);
+      if (!m) continue;
+      const pid = Number.parseInt(m[1], 10);
+      const cmd = m[2];
+      if (cmd.includes("glmproxy") && cmd.includes("cli.js") && pid !== selfPid) hits.push({ pid, cmd });
+    }
+  }
+  return hits;
+}
+
+function runStop() {
+  console.log(`\n  Looking for other glmproxy instances…`);
+  let hits = [];
+  try { hits = findGlmproxyInstances(); }
+  catch (e) { console.log(`  ${COLORS.RED}✗ scan failed: ${e.message}${COLORS.RESET}\n`); return; }
+
+  if (hits.length === 0) {
+    console.log(`  ${COLORS.GRAY}No other instances running.${COLORS.RESET}\n`);
+    return;
+  }
+
+  let killed = 0, failed = 0;
+  for (const { pid, cmd } of hits) {
+    const short = cmd.length > 96 ? `${cmd.slice(0, 96)}…` : cmd;
+    try {
+      process.kill(pid, "SIGTERM");
+      console.log(`  ${COLORS.GREEN}✓${COLORS.RESET} stopped PID ${pid} — ${short}`);
+      killed++;
+    } catch (e) {
+      console.log(`  ${COLORS.RED}✗${COLORS.RESET} PID ${pid} — ${e.code || e.message} — ${short}`);
+      failed++;
+    }
+  }
+  console.log(`\n  ${killed} instance(s) stopped${failed ? `, ${failed} failed` : ""}.\n`);
+}
+
+// --stop / stop: kill other running glmproxy instances, then exit.
+if (args.includes("--stop") || args[0] === "stop") {
+  runStop();
   process.exit(0);
 }
 

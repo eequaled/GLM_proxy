@@ -113,11 +113,26 @@ function anthropicToOpenAI(body, modelId) {
     const toolResults = [];
     const toolUses = [];
     const textParts = [];
+    const imageParts = [];
+
+    // Anthropic image block → OpenAI image_url part (AutoClaw's cloud accepts
+    // native vision parts on the chat/completions wire; probe-verified 2026-09-04).
+    const toOpenAIImage = (block) => {
+      const src = block?.source;
+      if (src?.type === "base64" && typeof src.data === "string") {
+        return { type: "image_url", image_url: { url: `data:${src.media_type || "image/png"};base64,${src.data}` } };
+      }
+      if (src?.type === "url" && typeof src.url === "string") {
+        return { type: "image_url", image_url: { url: src.url } };
+      }
+      return null;
+    };
 
     for (const block of content) {
       if (block.type === "tool_result")      toolResults.push(block);
       else if (block.type === "tool_use")    toolUses.push(block);
       else if (block.type === "text")        textParts.push(block.text);
+      else if (block.type === "image")       { const p = toOpenAIImage(block); if (p) imageParts.push(p); }
       else if (block.type === "thinking")    { /* skip */ }
     }
 
@@ -149,6 +164,13 @@ function anthropicToOpenAI(body, modelId) {
       };
       if (textParts.length > 0) msgObj.content = textParts.join("\n");
       messages.push(msgObj);
+    } else if (imageParts.length > 0 && msg.role !== "assistant") {
+      // Multimodal user turn: OpenAI array content with text + image parts.
+      const parts = [
+        ...textParts.map((t) => ({ type: "text", text: t })),
+        ...imageParts,
+      ];
+      messages.push({ role: msg.role, content: parts });
     } else if (textParts.length > 0) {
       messages.push({ role: msg.role, content: textParts.join("\n") });
     } else if (toolResults.length === 0 && toolUses.length === 0) {
