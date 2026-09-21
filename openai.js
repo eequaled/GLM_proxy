@@ -32,7 +32,7 @@ import {
   logUpstreamErrorBody, callUpstreamWithInvalidRequestRetry,
   callUpstreamOpenAI, streamLocalGatewayAgent, getLocalGatewayToken,
   classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
-  shouldFallbackToLocal, createPermanentFailureCache, getClientHeaders, VERSION,
+  shouldFallbackToLocal, createPermanentFailureCache, getClientHeaders, startIdentityWatch, VERSION,
 } from "./lib/core.js";
 
 // Config
@@ -56,6 +56,8 @@ function invalidateAuth() {
 
 startWatch();
 startBucketSweep();
+// Identity hot-reload + the hourly pinned-identity notice (lib/identity.js).
+startIdentityWatch(config, log);
 
 // SSE buffering (OpenAI-specific: assemble streamed chunks into a single response)
 function bufferSSE(upstreamRes, modelId) {

@@ -29,7 +29,7 @@ import {
   classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
   shouldFallbackToLocal, createPermanentFailureCache,
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
-  getClientHeaders, VERSION,
+  getClientHeaders, startIdentityWatch, VERSION,
 } from "./lib/core.js";
 
 // Config (per-format log filenames come from `format`)
@@ -52,6 +52,8 @@ function invalidateAuth() {
 
 startWatch();
 startBucketSweep();
+// Identity hot-reload + the hourly pinned-identity notice (lib/identity.js).
+startIdentityWatch(config, log);
 
 // ─── Credit-tier routing ────────────────────────────────────────────────────
 // Heuristic tiers apply immediately (startup never blocks on the network);

@@ -9,7 +9,7 @@ import { spawnSync } from "child_process";
 import {
   getModelCatalog, loadConfig, createTokenLayer,
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
-  getLocalGatewayToken, COLORS,
+  getLocalGatewayToken, getIdentityLayer, COLORS,
 } from "../lib/core.js";
 import { DEFAULT_PORTS, DEFAULT_HOST, DEFAULT_PROXY_KEY, TEST_PROXY_PORT } from "../lib/constants.js";
 
@@ -273,7 +273,20 @@ async function runDoctor() {
   console.log(`  claude-opus-*   → ${targets.opus ?? "?"}`);
   console.log(`  claude-sonnet-* → ${targets.sonnet ?? "?"}`);
   console.log(`  claude-haiku-*  → ${targets.haiku ?? "?"}`);
-  console.log(`  unknown model   → ${targets.default ?? "?"}\n`);
+  console.log(`  unknown model   → ${targets.default ?? "?"}`);
+
+  // Identity freshness (Requirement 1.5): which source supplies the client
+  // identity, how old the newest observation is, and whether the remote config
+  // advertises a different client version than the one we send.
+  try {
+    const identity = getIdentityLayer(config).freshness();
+    const age = identity.ageMs != null ? `${Math.round(identity.ageMs / 1000)}s ago` : "n/a";
+    console.log(`  Identity: ${identity.source} · X-Version=${identity.version ?? "?"} · observed ${age}`);
+    if (identity.knownDrift) {
+      console.log(`  ${COLORS.YELLOW}⚠ identity drift: sending ${identity.knownDrift.localVersion}, remote advertises ${identity.knownDrift.remoteVersion}${COLORS.RESET}`);
+    }
+  } catch (_) { /* identity freshness is diagnostic only */ }
+  console.log("");
 }
 
 if (args.includes("--help") || args.includes("-h")) {
@@ -431,8 +444,8 @@ if (!hasFlags && process.stdin.isTTY) {
     }
 
     if (action === "limit") {
-      const current = Number.isFinite(config_maxMessages())
-        ? `${config_maxMessages()} entries`
+      const current = Number.isFinite(effectiveMaxMessages())
+        ? `${effectiveMaxMessages()} entries`
         : `${COLORS.GREEN}unlimited${COLORS.RESET}`;
       const entityLimit = await promptSelect({
         message: "Max entity / messages limit:",

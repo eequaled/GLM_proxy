@@ -13,16 +13,46 @@ export async function startTlsMock(scenario = {}) {
   return { mock, port };
 }
 
+// Captured stdout/stderr per spawned proxy, so suites can assert on operator-facing
+// notices (pinned-identity warnings, budget notices, override logs) that the
+// previous `stdio: "ignore"` made unobservable. Keyed by ChildProcess so the
+// existing `stopProxy(proc)` signature keeps working unchanged.
+const PROXY_OUTPUT = new WeakMap();
+
+// The TLS mock upstream is signed by a committed test CA (tests/fixtures/certs).
+// NODE_EXTRA_CA_CERTS is append-only trust, so setting it is additive for every
+// suite — live-upstream tests keep verifying against the real chain.
+const TEST_CA = path.join(ROOT, "tests", "fixtures", "certs", "cert.pem");
+
 export function startProxy(port, env = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn("node", [path.join(ROOT, "openai.js")], {
-      env: { ...process.env, PORT: String(port), HOST: "127.0.0.1", PROXY_KEY: "pen-test-key", LOG_LEVEL: "silent", RATE_LIMIT: "200", ...env },
-      stdio: "ignore",
+      env: {
+        ...process.env,
+        PORT: String(port), HOST: "127.0.0.1", PROXY_KEY: "pen-test-key", LOG_LEVEL: "silent", RATE_LIMIT: "200",
+        NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS || TEST_CA,
+        ...env,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
+    const captured = { stdout: "", stderr: "" };
+    PROXY_OUTPUT.set(proc, captured);
+    // Listeners stay attached (never detached) so the pipes drain continuously.
+    proc.stdout?.on("data", (c) => { captured.stdout += c.toString("utf8"); });
+    proc.stderr?.on("data", (c) => { captured.stderr += c.toString("utf8"); });
     proc.on("error", reject);
     waitForServer(port, 50).then(() => resolve(proc)).catch(reject);
   });
+}
+
+// Read whatever the proxy has printed so far. `all` is the merged stream, which
+// is what notice assertions want — the logger writes info to stdout and warns
+// to stderr, and which one a notice lands on is an implementation detail.
+export function proxyOutput(proc) {
+  const c = PROXY_OUTPUT.get(proc);
+  if (!c) return { stdout: "", stderr: "", all: "" };
+  return { stdout: c.stdout, stderr: c.stderr, all: c.stdout + c.stderr };
 }
 
 export async function stopProxy(proc) {
