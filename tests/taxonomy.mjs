@@ -278,6 +278,40 @@ check("GLMP_HARNESS_TYPE= (empty) sends no harness declaration at all", () => {
   }
 });
 
+// One state-dir rule for the whole proxy. The app relocates its state with this
+// env var, so the token, the runtime config and the proxy's own state all have
+// to follow it — otherwise a relocated install reads a stale path silently.
+check("OPENCLAW_STATE_DIR carries the token, runtime and proxy-state paths with it", () => {
+  const prevOpen = process.env.OPENCLAW_STATE_DIR;
+  const prevProxy = process.env.PROXY_STATE_DIR;
+  const moved = path.join(os.tmpdir(), "glmp-relocated-state");
+  process.env.OPENCLAW_STATE_DIR = moved;
+  delete process.env.PROXY_STATE_DIR;
+  try {
+    const cfg = loadConfig({ format: "openai" });
+    assert.equal(cfg.AUTOCLAW_STATE_DIR, moved);
+    assert.equal(cfg.TOKEN_FILE, path.join(moved, "request-headers.json"));
+    assert.equal(cfg.RUNTIME_FILE, path.join(moved, "openclaw.runtime.json"));
+    assert.equal(cfg.RUNTIME_LAST_GOOD, path.join(moved, "openclaw.runtime.json.last-good"));
+    assert.equal(cfg.STATE_DIR, path.join(moved, "proxy-state"));
+  } finally {
+    if (prevOpen === undefined) delete process.env.OPENCLAW_STATE_DIR; else process.env.OPENCLAW_STATE_DIR = prevOpen;
+    if (prevProxy === undefined) delete process.env.PROXY_STATE_DIR; else process.env.PROXY_STATE_DIR = prevProxy;
+  }
+});
+
+check("without it, the default state dir is still the app's usual one", () => {
+  const prevOpen = process.env.OPENCLAW_STATE_DIR;
+  delete process.env.OPENCLAW_STATE_DIR;
+  try {
+    const cfg = loadConfig({ format: "openai" });
+    assert.equal(cfg.AUTOCLAW_STATE_DIR, path.join(os.homedir(), ".openclaw-autoclaw"));
+    assert.equal(cfg.TOKEN_FILE, path.join(os.homedir(), ".openclaw-autoclaw", "request-headers.json"));
+  } finally {
+    if (prevOpen !== undefined) process.env.OPENCLAW_STATE_DIR = prevOpen;
+  }
+});
+
 check("FALLBACK_MODELS_PATH override is honored", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "glmproxy-fb-"));
   fs.writeFileSync(path.join(tmp, "models.json"), JSON.stringify({ models: [{ id: "custom-model", name: "Custom" }] }));

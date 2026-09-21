@@ -36,6 +36,10 @@ export function startProxy(port, env = {}) {
         // the governor's own suite and turns both knobs back on explicitly.
         BUDGET_REQUESTS_PER_HOUR: "0", GLMP_MIN_GAP_MS: "0",
         NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS || TEST_CA,
+        // Blanked by default so a relocated-state env var on the developer's
+        // machine cannot defeat a case that isolates via a fake HOME below.
+        // A case that means to exercise relocation sets these explicitly.
+        OPENCLAW_STATE_DIR: "", PROXY_STATE_DIR: "",
         ...env,
       },
       stdio: ["ignore", "pipe", "pipe"],

@@ -57,7 +57,7 @@ async function waitForServer() {
 async function checkProxy(entrypoint, messagePath) {
   writeCatalog("runtime-model-one");
   const proc = spawn("node", [path.join(ROOT, entrypoint)], {
-    env: { ...process.env, HOME: testHome, USERPROFILE: testHome, PORT: String(port), HOST: "127.0.0.1", PROXY_KEY: key, LOG_LEVEL: "silent" },
+    env: { ...process.env, HOME: testHome, USERPROFILE: testHome, OPENCLAW_STATE_DIR: "", PROXY_STATE_DIR: "", PORT: String(port), HOST: "127.0.0.1", PROXY_KEY: key, LOG_LEVEL: "silent" },
     stdio: "ignore",
     windowsHide: true,
   });

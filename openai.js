@@ -9,7 +9,8 @@
  * in lib/core.js.
  *
  * How auth works: AutoClaw keeps a fresh JWT at
- * ~/.openclaw-autoclaw/request-headers.json, auto-refreshed whenever it
+ * ~/.openclaw-autoclaw/request-headers.json (or $OPENCLAW_STATE_DIR/request-headers.json
+ * if AutoClaw is running with a relocated state dir), auto-refreshed whenever it
  * rotates. We read that file on startup and re-read every TOKEN_TTL_MS —
  * zero manual auth setup required.
  *

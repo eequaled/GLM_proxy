@@ -61,15 +61,31 @@ function makeHome() {
 // loadConfig() and stateDir() both resolve os.homedir() at call time, so the
 // env has to stay swapped for the whole case — configs captured under one home
 // must not leak into the next.
+//
+// OPENCLAW_STATE_DIR is the app's own relocation rule and outranks homedir, so
+// it has to be cleared here too: on a machine that sets it (the proxy's own
+// users can have it set), a fake HOME alone would leave discovery pointed at the
+// real state dir and every isolation case would silently read the real app.
 async function withHome(home, fn) {
-  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  const saved = {
+    HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE,
+    OPENCLAW_STATE_DIR: process.env.OPENCLAW_STATE_DIR,
+    PROXY_STATE_DIR: process.env.PROXY_STATE_DIR,
+  };
+  const restore = (key) => {
+    if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
+  };
   process.env.HOME = home;
   process.env.USERPROFILE = home;
+  delete process.env.OPENCLAW_STATE_DIR;
+  delete process.env.PROXY_STATE_DIR;
   try {
     return await fn();
   } finally {
-    if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
-    if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.USERPROFILE;
+    restore("HOME");
+    restore("USERPROFILE");
+    restore("OPENCLAW_STATE_DIR");
+    restore("PROXY_STATE_DIR");
   }
 }
 
