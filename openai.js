@@ -35,6 +35,7 @@ import {
   classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
   shouldFallbackToLocal, createPermanentFailureCache, getClientHeaders, startIdentityWatch, installShutdownHooks, VERSION,
   getPacingGovernor, classifyGovernorError,
+  startConfigHeartbeat,
 } from "./lib/core.js";
 
 // Config
@@ -69,6 +70,15 @@ installShutdownHooks(config, log);
 // normalization and the transport on purpose — a request it refuses never
 // opens an upstream socket, which is the promise p7 proves by counting hits.
 const governor = getPacingGovernor(config, log, { getToken });
+
+// Companion traffic (Requirement 5). The real app does not only send
+// completions — it polls its own model config every 300 s, and a proxy that
+// only ever emits completions is a traffic-mix anomaly. The heartbeat mirrors
+// that cadence, keeps the catalog fresh without a restart (getModelCatalog()
+// prefers the last payload it fetched over the compiled-in pin), feeds the
+// identity layer's drift report, and doubles as the cheap ban-lift probe: a
+// 200 from a GET, never a completion. HEARTBEAT_INTERVAL_MS=0 disables it.
+startConfigHeartbeat(config, log, { getToken });
 
 // Upstream `Retry-After` (delay-seconds or an HTTP date) → milliseconds. The
 // governor caps it, so a hostile value cannot wedge the proxy for a day.

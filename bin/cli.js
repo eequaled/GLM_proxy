@@ -9,7 +9,7 @@ import { spawnSync } from "child_process";
 import {
   getModelCatalog, loadConfig, createTokenLayer,
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
-  getLocalGatewayToken, getIdentityLayer, getPacingGovernor, COLORS,
+  getLocalGatewayToken, getIdentityLayer, getPacingGovernor, getConfigHeartbeat, COLORS,
 } from "../lib/core.js";
 import { DEFAULT_PORTS, DEFAULT_HOST, DEFAULT_PROXY_KEY, TEST_PROXY_PORT } from "../lib/constants.js";
 
@@ -342,6 +342,23 @@ async function runDoctor() {
       }
     }
   } catch (_) { /* governor reporting is diagnostic only */ }
+
+  // Companion traffic (Requirement 5.4): the heartbeat's cadence and health.
+  // The doctor does not start it — a fresh process has not polled yet, and
+  // "never" is the honest reading. consecutiveFailures is the field that
+  // matters when the config endpoint is down or the account is quarantined.
+  try {
+    const silent = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, success: () => {} };
+    const hb = getConfigHeartbeat(config, silent).status();
+    const every = hb.intervalMs ? `${Math.round(hb.intervalMs / 1000)}s` : "off";
+    const last = hb.lastPollAt != null ? `${Math.round((Date.now() - hb.lastPollAt) / 1000)}s ago` : "never";
+    const failures = hb.consecutiveFailures
+      ? ` · ${COLORS.YELLOW}${hb.consecutiveFailures} consecutive failure(s)${COLORS.RESET}`
+      : "";
+    console.log(`  Heartbeat: ${every} · polls ${hb.polls} · last ${last}${failures}`);
+    if (hb.lastError) console.log(`  ${COLORS.YELLOW}⚠ heartbeat: ${hb.lastError}${COLORS.RESET}`);
+  } catch (_) { /* heartbeat reporting is diagnostic only */ }
+
   console.log("");
 }
 

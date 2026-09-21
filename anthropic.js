@@ -31,6 +31,7 @@ import {
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
   getClientHeaders, startIdentityWatch, installShutdownHooks, VERSION,
   getPacingGovernor, classifyGovernorError,
+  startConfigHeartbeat,
 } from "./lib/core.js";
 
 // Config (per-format log filenames come from `format`)
@@ -91,6 +92,23 @@ async function refreshTiers() {
   log.info(`Credit-tier routing: opus→${tierTargets.opus} sonnet→${tierTargets.sonnet} haiku→${tierTargets.haiku} default→${tierTargets.default}`);
 }
 refreshTiers();
+
+// Companion traffic (Requirement 5): the same 300 s model-config poll the
+// desktop app runs. Catalog changes land through the shared remote-catalog
+// slot, so a renamed model reaches /v1/models without a restart; the Claude
+// alias routing is re-derived here because it is a pure function of the
+// catalog. HEARTBEAT_INTERVAL_MS=0 disables the poll.
+startConfigHeartbeat(config, log, {
+  getToken,
+  onCatalog: (models) => {
+    try {
+      tierTargets = resolveTierTargets(annotateCreditTiers(getModelCatalog(config).models, models));
+      log.info(`Credit-tier routing refreshed: opus→${tierTargets.opus} sonnet→${tierTargets.sonnet} haiku→${tierTargets.haiku} default→${tierTargets.default}`);
+    } catch (err) {
+      log.warn(`Credit-tier refresh failed (${err.message}) — keeping the previous routing`);
+    }
+  },
+});
 
 // Resolve any Anthropic model name to an AutoClaw model ID:
 // exact catalog IDs pass through untouched; claude-* names map by class.
