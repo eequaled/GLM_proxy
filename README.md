@@ -262,7 +262,7 @@ glmproxy --test-models
 | `LOCAL_GATEWAY_HOST` / `LOCAL_GATEWAY_PORT` | `127.0.0.1` / `18789` | Where the AutoClaw desktop gateway is expected |
 | `FALLBACK_MODELS_PATH` | empty | Path to an external fallback model catalog JSON (`{"models":[...]}`), defaults to the shipped `lib/fallback-models.json` |
 | `AUTOCLAW_SYSTEM_BANNER` | built-in | Override the system-prompt banner injected into cloud requests (keep the `## Tooling` line intact) |
-| `GLMP_IDENTITY_VERSION` | discovered (fallback `1.17.5`) | Pin the client `X-Version` the proxy sends. Normally discovered from your installed app and cached in `~/.openclaw-autoclaw/proxy-state/identity.last-good.json`, so a closed app still reports the last observed version instead of a stale pin. Set this only to override discovery (e.g. while the app is mid-update); the proxy logs when an override is active |
+| `GLMP_IDENTITY_VERSION` | discovered (fallback `1.18.5`) | Pin the client `X-Version` the proxy sends. Normally discovered from your installed app and cached in `~/.openclaw-autoclaw/proxy-state/identity.last-good.json`, so a closed app still reports the last observed version instead of a stale pin. Set this only to override discovery (e.g. while the app is mid-update); the proxy logs when an override is active |
 | `GLMP_USER_AGENT` | derived `AutoClaw/<version> (<platform>)` | Override the upstream `User-Agent` header |
 | `GLMP_ACCEPT` | `application/json, text/event-stream` | Override the upstream `Accept` header |
 | `--anthropic` | — | Run in Anthropic API format |
