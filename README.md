@@ -323,6 +323,7 @@ Every failure maps to a semantically correct status with a machine-readable `cod
 |-----------|------|--------|
 | Bad client input (bad JSON / oversized / wrong Content-Type) | `400` / `413` / `415` | `invalid_request` |
 | Model out of credits or free quota (upstream 402/403/810000) | `402` | `quota_exhausted` |
+| Free-tier capacity throttle, "high demand" (upstream 403/810002) | `429` | `upstream_busy` |
 | AutoClaw token expired | `401` | `token_expired` |
 | Model unknown upstream | `404` | `model_not_found` |
 | Upstream rate limit | `429` | `rate_limited_by_upstream` |

@@ -75,6 +75,19 @@ export function createMockUpstream(initialScenario = {}) {
         return;
       }
 
+      // Free-tier capacity throttle: 403 + 810002 with "kind":"pay-view". The
+      // account is fine; the free tier is busy. Measured live 2026-09-21.
+      if (scenario.payview) {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          action: { kind: "pay-view" },
+          code: 810002,
+          image_url: "https://example.invalid/high-demand.png",
+          message: "We're experiencing high demand right now. Please try again shortly, or upgrade to a monthly subscription for priority access.",
+        }));
+        return;
+      }
+
       // Ban scenario
       if (scenario.ban || scenario.status === 403) {
         res.writeHead(403, {

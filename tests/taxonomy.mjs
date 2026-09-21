@@ -291,6 +291,19 @@ check("403 + 410004 banned body → permanent 403 account_banned", () => {
   assert.match(c.message, /Account banned/);
 });
 
+// The free-tier capacity throttle (403 + 810002, "kind":"pay-view") is neither a
+// ban nor quota exhaustion — the account works again shortly. It must classify as
+// a 429 so clients back off, and so the local-agent fallback is refused: measured
+// on a live 2026-09-21 session, every 810002 otherwise spent the full 120 s local
+// budget on a run that re-issues the same cloud call and fails identically.
+check("403 + 810002 pay-view throttle → 429 upstream_busy, never the local agent", () => {
+  const c = classifyUpstreamError(403, '{"action":{"kind":"pay-view"},"code":810002,"image_url":"https://example.invalid/f.png","message":"We\'re experiencing high demand right now. Please try again shortly, or upgrade to a monthly subscription for priority access."}', "tdpsk_deepseek-v4-flash-202605");
+  assert.equal(c.status, 429);
+  assert.equal(c.code, "upstream_busy");
+  assert.equal(c.permanent, false);
+  assert.equal(shouldFallbackToLocal(c.status), false);
+});
+
 check("账号已被封禁 translates to English", () => {
   assert.equal(translateUpstreamError("账号已被封禁"), "Account banned by AutoClaw");
 });
