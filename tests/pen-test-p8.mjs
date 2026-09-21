@@ -82,9 +82,9 @@ const first = await chat(PORT);
 check("h1: request through the mock succeeds", first.status === 200, `${first.status} ${String(first.body).slice(0, 120)}`);
 
 const h1Headers = mockA.mock.getLastRequest()?.headers || {};
-check("h1: sends a User-Agent derived from the app version",
-  /^AutoClaw\/1\.17\.8/.test(h1Headers["user-agent"] || ""), h1Headers["user-agent"]);
-check("h1: sends an Accept header", Boolean(h1Headers["accept"]), h1Headers["accept"]);
+check("h1: sends the User-Agent the real client sends (undici stack default, not an invented token)",
+  h1Headers["user-agent"] === "node", h1Headers["user-agent"]);
+check("h1: sends the Accept the app sets (`*/*`)", h1Headers["accept"] === "*/*", h1Headers["accept"]);
 check("h1: identity overlay reaches the wire (X-Version from the app runtime file)",
   h1Headers["x-version"] === VERSION, h1Headers["x-version"]);
 check("h1: never advertises an encoding it cannot decode",

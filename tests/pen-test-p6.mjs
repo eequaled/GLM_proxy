@@ -152,8 +152,8 @@ await withHome(makeHome(), async () => {
   check("startup warning tells the operator it is running on pinned identity",
     warns.some((w) => /running on pinned identity/.test(w)), warns.join(" | "));
   check("warning names the fix", warns.some((w) => /GLMP_IDENTITY_VERSION|Run AutoClaw once/.test(w)));
-  check("derived User-Agent tracks the version instead of being frozen",
-    id.userAgent === `AutoClaw/${config.CLIENT_HEADERS["X-Version"]} (win)`, id.userAgent);
+  check("User-Agent is the value the real client actually sends, not an invented product token",
+    id.userAgent === "node", id.userAgent);
 
   // ---- 6. env override wins and says so -----------------------------------
   const homeB = makeHome();

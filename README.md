@@ -264,8 +264,8 @@ glmproxy --test-models
 | `FALLBACK_MODELS_PATH` | empty | Path to an external fallback model catalog JSON (`{"models":[...]}`), defaults to the shipped `lib/fallback-models.json` |
 | `AUTOCLAW_SYSTEM_BANNER` | built-in | Override the system-prompt banner injected into cloud requests (keep the `## Tooling` line intact) |
 | `GLMP_IDENTITY_VERSION` | discovered (fallback `1.18.5`) | Pin the client `X-Version` the proxy sends. Normally discovered from your installed app and cached in `~/.openclaw-autoclaw/proxy-state/identity.last-good.json`, so a closed app still reports the last observed version instead of a stale pin. Set this only to override discovery (e.g. while the app is mid-update); the proxy logs when an override is active |
-| `GLMP_USER_AGENT` | derived `AutoClaw/<version> (<platform>)` | Override the upstream `User-Agent` header |
-| `GLMP_ACCEPT` | `application/json, text/event-stream` | Override the upstream `Accept` header |
+| `GLMP_USER_AGENT` | `node` (measured) | Override the upstream `User-Agent` header. The real client sends **`node`** — undici's stack default — because it publishes no UA of its own; a product-token UA would be a *more* distinctive signal than the truth, so this default is the faithful one |
+| `GLMP_ACCEPT` | `*/*` (measured) | Override the upstream `Accept` header. The app sets this to `*/*` |
 | `--anthropic` | — | Run in Anthropic API format |
 | `--openai` | — | Run in OpenAI API format (default) |
 | `--limit [n]` | — | Set or clear the max message/entity limit (e.g. `--limit 256`; bare `--limit` prints the current value) |
