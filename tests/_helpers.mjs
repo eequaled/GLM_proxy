@@ -3,7 +3,15 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createMockUpstream } from "./fixtures/mock-upstream.mjs";
+
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+export async function startTlsMock(scenario = {}) {
+  const mock = createMockUpstream(scenario);
+  const port = await mock.start();
+  return { mock, port };
+}
 
 export function startProxy(port, env = {}) {
   return new Promise((resolve, reject) => {
