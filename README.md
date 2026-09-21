@@ -258,6 +258,7 @@ glmproxy --test-models
 | `JSONL_SYNC` | off | Write JSONL lines synchronously when `true` (flush every line) |
 | `JSONL_MAX_BYTES` | `10485760` | Rotate JSONL log when it exceeds this (10 MB) |
 | `UPSTREAM_TIMEOUT_MS` | `120000` | Per-attempt upstream budget (idle-based, the vendor allows up to 20 min, raise this for slow thinking models) |
+| `LOCAL_AGENT_TIMEOUT_MS` | `120000` | Budget for the local AutoClaw desktop-agent fallback. That path drives a real agent session (seconds to minutes by design), but if your client gives up sooner than this you get a client-side timeout instead of the classified error — lower it so failures surface while your harness is still listening |
 | `GATEWAY_MIN_PROTOCOL` / `GATEWAY_MAX_PROTOCOL` | `3` / `4` | Local-gateway WS protocol range offered on connect (self-heals to the gateway's expected protocol on mismatch) |
 | `LOCAL_GATEWAY_HOST` / `LOCAL_GATEWAY_PORT` | `127.0.0.1` / `18789` | Where the AutoClaw desktop gateway is expected |
 | `FALLBACK_MODELS_PATH` | empty | Path to an external fallback model catalog JSON (`{"models":[...]}`), defaults to the shipped `lib/fallback-models.json` |

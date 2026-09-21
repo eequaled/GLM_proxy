@@ -234,6 +234,7 @@ async function handleChatCompletions(req, res) {
       streamLocalGatewayAgent({
         config,
         modelId,
+        timeoutMs: config.LOCAL_AGENT_TIMEOUT_MS,
         messages: body.messages,
         onChunk: ({ delta }) => {
           if (stream) {
@@ -363,7 +364,7 @@ async function handleChatCompletions(req, res) {
       if (!cls.permanent || !permanentFailures.get(modelId)) {
         if (await tryLocalAgent()) return;
       } else {
-        log.info(`Skipping local fallback for ${modelId}: ${cls.code} is account-wide`);
+        log.info(`Skipping local fallback for ${modelId}: ${cls.code} is permanent`);
       }
 
       record(cls.status, {
