@@ -31,7 +31,7 @@ import {
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
   getClientHeaders, startIdentityWatch, installShutdownHooks, VERSION,
   getPacingGovernor, classifyGovernorError,
-  startConfigHeartbeat,
+  startConfigHeartbeat, startShapeWatch,
 } from "./lib/core.js";
 
 // Config (per-format log filenames come from `format`)
@@ -56,6 +56,9 @@ startWatch();
 startBucketSweep();
 // Identity hot-reload + the hourly pinned-identity notice (lib/identity.js).
 startIdentityWatch(config, log);
+// The request-shape layer: re-read the app's own prompt banner when its bundle
+// changes, so an app update needs no proxy restart (lib/shape.js).
+startShapeWatch(config, log);
 // Ctrl+C / `glmproxy --stop` release the h2 session, the keep-alive sockets and
 // the identity watchers instead of leaving them to the OS.
 installShutdownHooks(config, log);
@@ -666,7 +669,7 @@ async function handleMessages(req, res) {
     // Cloud call with one retry on the flaky 400 "invalid request" hiccup;
     // every >=400 body is buffered + logged (R1). Shared with openai.js.
     const { res: upstreamRes, errBody: upstreamErrBody } = await callUpstreamWithInvalidRequestRetry(
-      () => callUpstreamAnthropic(config, getClientHeaders(config), getToken, openAIBody, modelId),
+      () => callUpstreamAnthropic(config, getClientHeaders(config), getToken, openAIBody, modelId, null, log),
       modelId, permanentFailures, log,
     );
 
