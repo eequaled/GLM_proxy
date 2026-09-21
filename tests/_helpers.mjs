@@ -30,6 +30,11 @@ export function startProxy(port, env = {}) {
       env: {
         ...process.env,
         PORT: String(port), HOST: "127.0.0.1", PROXY_KEY: "pen-test-key", LOG_LEVEL: "silent", RATE_LIMIT: "200",
+        // Pacing is OFF by default for suites: p1-p5 spawn against the REAL home,
+        // so a persisted budget window would accumulate across `npm test` runs
+        // and eventually 429 a suite that has nothing to do with pacing. p7 is
+        // the governor's own suite and turns both knobs back on explicitly.
+        BUDGET_REQUESTS_PER_HOUR: "0", GLMP_MIN_GAP_MS: "0",
         NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS || TEST_CA,
         ...env,
       },
@@ -77,7 +82,9 @@ export function post(port, { path = "/v1/chat/completions", body, headers = {}, 
     }, (res) => {
       let data = "";
       res.on("data", (c) => (data += c));
-      res.on("end", () => resolve({ status: res.statusCode, body: data }));
+      // Headers ride along so suites can assert response-level contracts
+      // (Retry-After on the governor's 429) without a second HTTP client.
+      res.on("end", () => resolve({ status: res.statusCode, body: data, headers: res.headers }));
     });
     // Resolve on failures too — connection resets are a valid pen-test outcome
     req.on("error", (err) => resolve({ status: 0, body: err.code || err.message }));

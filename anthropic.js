@@ -30,6 +30,7 @@ import {
   shouldFallbackToLocal, createPermanentFailureCache,
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
   getClientHeaders, startIdentityWatch, installShutdownHooks, VERSION,
+  getPacingGovernor, classifyGovernorError,
 } from "./lib/core.js";
 
 // Config (per-format log filenames come from `format`)
@@ -57,6 +58,22 @@ startIdentityWatch(config, log);
 // Ctrl+C / `glmproxy --stop` release the h2 session, the keep-alive sockets and
 // the identity watchers instead of leaving them to the OS.
 installShutdownHooks(config, log);
+
+// Account pacing governor (Requirement 3) — same one-window-per-account guard
+// as openai.js, keyed on the JWT `user_id`. Placed before the transport so a
+// refused request never opens an upstream socket.
+const governor = getPacingGovernor(config, log, { getToken });
+
+// Upstream `Retry-After` (delay-seconds or an HTTP date) → milliseconds, for
+// the governor's bounded backoff.
+function retryAfterMsFrom(upstreamRes) {
+  const raw = upstreamRes?.headers?.["retry-after"];
+  if (raw == null) return null;
+  const secs = Number(raw);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const when = Date.parse(String(raw));
+  return Number.isFinite(when) ? Math.max(0, when - Date.now()) : null;
+}
 
 // ─── Credit-tier routing ────────────────────────────────────────────────────
 // Heuristic tiers apply immediately (startup never blocks on the network);
@@ -513,6 +530,9 @@ async function handleMessages(req, res) {
   // consumed by record() so the terminal entry carries the cloud verdict.
   let cloudEvidence = null;
   const tryLocalAgent = () => {
+    // Local-agent requests never touch the cloud transport: not metered against
+    // the account budget, but counted so `--doctor` can attribute the session.
+    governor.noteLocal();
     if (!getLocalGatewayToken()) return Promise.resolve(false);
     log.info(`Executing chat model=${modelId} via local AutoClaw WebSocket agent...`);
     return new Promise((resolve) => {
@@ -614,6 +634,17 @@ async function handleMessages(req, res) {
       return sendClassifiedErrorAnthropic(res, cachedFailure);
     }
 
+    // Governor gate — after the cache short-circuit (no upstream call, so no
+    // budget spent) and before the cloud call (a refusal must not open a socket).
+    await governor.waitForGap();
+    const verdict = governor.tryAcquire(null, { diagnostic: config.DIAGNOSTIC_MODE });
+    if (!verdict.ok) {
+      const cls = classifyGovernorError(verdict);
+      log.warn(`Governor refused model=${modelId}: ${cls.code} (${verdict.state}) — ${cls.message}`);
+      record(cls.status, { lastMessage: lastMsgForLog(), messageCount: openAIBody.messages?.length || 0, error: cls.code });
+      return sendClassifiedErrorAnthropic(res, cls);
+    }
+
     // Cloud call with one retry on the flaky 400 "invalid request" hiccup;
     // every >=400 body is buffered + logged (R1). Shared with openai.js.
     const { res: upstreamRes, errBody: upstreamErrBody } = await callUpstreamWithInvalidRequestRetry(
@@ -622,6 +653,13 @@ async function handleMessages(req, res) {
     );
 
     const statusCode = upstreamRes.statusCode;
+
+    // Feed the verdict back to the governor (throttle → backoff, ban →
+    // quarantine, success → clear) so a capacity throttle is never answered by
+    // retrying into it.
+    governor.recordUpstreamSignal(null, statusCode, upstreamErrBody || "", {
+      retryAfterMs: retryAfterMsFrom(upstreamRes),
+    });
 
     // Rotate token caches BEFORE deciding fallback so the very next request
     // picks up the fresh JWT regardless of who serves this one.
@@ -744,6 +782,9 @@ server.listen(config.PORT, config.HOST, () => {
       `Port     : ${config.PORT}`,
       `Auth Key : ${config.PROXY_KEY}`,
       `Rate Lim : ${config.RATE_LIMIT} req/s per IP`,
+      `Governor : ${config.BUDGET_REQUESTS_PER_HOUR === 0
+        ? "off — upstream requests are unmetered"
+        : `${config.BUDGET_REQUESTS_PER_HOUR} req/h per account (warn at 80%)`}`,
       `Max Msgs : ${Number.isFinite(config.MAX_MESSAGES) ? `${config.MAX_MESSAGES} entries` : "unlimited"}`,
       `Models   : ${MODELS.map(m => m.id).join(", ")}`,
       "",

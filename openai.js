@@ -33,6 +33,7 @@ import {
   callUpstreamOpenAI, streamLocalGatewayAgent, getLocalGatewayToken,
   classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
   shouldFallbackToLocal, createPermanentFailureCache, getClientHeaders, startIdentityWatch, installShutdownHooks, VERSION,
+  getPacingGovernor, classifyGovernorError,
 } from "./lib/core.js";
 
 // Config
@@ -61,6 +62,23 @@ startIdentityWatch(config, log);
 // Ctrl+C / `glmproxy --stop` release the h2 session, the keep-alive sockets and
 // the identity watchers instead of leaving them to the OS.
 installShutdownHooks(config, log);
+
+// Account pacing governor (Requirement 3): one sliding hourly window per
+// AutoClaw account, keyed on the JWT's `user_id`. It sits between request
+// normalization and the transport on purpose — a request it refuses never
+// opens an upstream socket, which is the promise p7 proves by counting hits.
+const governor = getPacingGovernor(config, log, { getToken });
+
+// Upstream `Retry-After` (delay-seconds or an HTTP date) → milliseconds. The
+// governor caps it, so a hostile value cannot wedge the proxy for a day.
+function retryAfterMsFrom(upstreamRes) {
+  const raw = upstreamRes?.headers?.["retry-after"];
+  if (raw == null) return null;
+  const secs = Number(raw);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const when = Date.parse(String(raw));
+  return Number.isFinite(when) ? Math.max(0, when - Date.now()) : null;
+}
 
 // SSE buffering (OpenAI-specific: assemble streamed chunks into a single response)
 function bufferSSE(upstreamRes, modelId) {
@@ -225,6 +243,10 @@ async function handleChatCompletions(req, res) {
   // gateway is simply unavailable.
   const tryLocalAgent = () => {
     if (!getLocalGatewayToken()) return Promise.resolve(false);
+    // Local-agent requests never touch the cloud transport, so they are not
+    // metered against the account budget — but they are counted separately, so
+    // `--doctor` can show how much of the session the fallback served.
+    governor.noteLocal();
     log.info(`Executing chat model=${modelId} via local AutoClaw WebSocket agent...`);
     return new Promise((resolve) => {
       let fullContent = "";
@@ -316,7 +338,13 @@ async function handleChatCompletions(req, res) {
 
     // Non-stream: buffer SSE, assemble full response object
     try {
-      sendJSON(res, await bufferSSE(successRes, modelId));
+      const assembled = await bufferSSE(successRes, modelId);
+      // Best-effort burn accounting from the upstream's own usage metadata —
+      // the audit found no per-response credit field, so a request-count budget
+      // stays the enforcement mechanism and credits are reported only if the
+      // upstream ever starts publishing them.
+      governor.recordUsage(null, assembled?.usage);
+      sendJSON(res, assembled);
     } catch (err) {
       if (!res.headersSent) sendErrorOpenAI(res, err.message, "api_error", 502, "upstream_parse_failed");
       else { try { res.end(); } catch (_) {} }
@@ -338,6 +366,19 @@ async function handleChatCompletions(req, res) {
       return sendClassifiedErrorOpenAI(res, cachedFailure);
     }
 
+    // Governor gate. Deliberately AFTER the cache short-circuit (a request that
+    // never reaches upstream must not spend a budget slot) and BEFORE the cloud
+    // call (a refused request must not reach upstream at all).
+    // Both are paced: the gap breaks robotic bursts, the budget bounds the hour.
+    await governor.waitForGap();
+    const verdict = governor.tryAcquire(null, { diagnostic: config.DIAGNOSTIC_MODE });
+    if (!verdict.ok) {
+      const cls = classifyGovernorError(verdict);
+      log.warn(`Governor refused model=${modelId}: ${cls.code} (${verdict.state}) — ${cls.message}`);
+      record(cls.status, { model: modelId, lastMessage: lastMsgForLog(), error: cls.code });
+      return sendClassifiedErrorOpenAI(res, cls);
+    }
+
     // Cloud call with one retry on the flaky 400 "invalid request" hiccup;
     // every >=400 body is buffered + logged (R1). Shared with anthropic.js.
     const { res: upstreamRes, errBody: upstreamErrBody } = await callUpstreamWithInvalidRequestRetry(
@@ -346,6 +387,14 @@ async function handleChatCompletions(req, res) {
     );
 
     const effectiveStatus = upstreamRes.statusCode;
+
+    // Feed the verdict back into the governor: a throttle engages the backoff,
+    // a ban quarantines the account, and a success clears both. Without this
+    // the proxy answers a capacity throttle by retrying into it — the live
+    // session measured on 2026-09-21 lost ~26 minutes doing exactly that.
+    governor.recordUpstreamSignal(null, effectiveStatus, upstreamErrBody || "", {
+      retryAfterMs: retryAfterMsFrom(upstreamRes),
+    });
 
     if (effectiveStatus < 400) return respondSuccess(upstreamRes);
 
@@ -414,6 +463,9 @@ server.listen(config.PORT, config.HOST, () => {
       `Port     : ${config.PORT}`,
       `Auth Key : ${config.PROXY_KEY}`,
       `Rate Lim : ${config.RATE_LIMIT} req/s per IP`,
+      `Governor : ${config.BUDGET_REQUESTS_PER_HOUR === 0
+        ? "off — upstream requests are unmetered"
+        : `${config.BUDGET_REQUESTS_PER_HOUR} req/h per account (warn at 80%)`}`,
       `Max Msgs : ${Number.isFinite(config.MAX_MESSAGES) ? `${config.MAX_MESSAGES} entries` : "unlimited"}`,
       `Models   : ${MODELS.map(m => m.id).join(", ")}`,
       "",

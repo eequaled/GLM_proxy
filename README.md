@@ -128,6 +128,8 @@ for await (const chunk of stream) {
 
 AutoClaw gives you Zhipu's GLM models (GLM-5.3, GLM-5-Turbo, GLM-5.3-Flash, plus DeepSeek), but locks them inside its own desktop app. This proxy speaks OpenAI and Anthropic API dialects on one side and AutoClaw's native protocol on the other, so any tool built for those APIs can drive AutoClaw's models. The model list is pulled live from AutoClaw's runtime config, so anything AutoClaw adds or removes shows up without a proxy restart.
 
+It also paces itself: a sliding hourly request budget per account keeps a runaway harness from burning your account into a ban. See [Account safety](#account-safety).
+
 ## How it works
 
 ```
@@ -245,6 +247,9 @@ glmproxy --test-models
 | `HOST` / `--host` | `127.0.0.1` | Bind address |
 | `PROXY_KEY` / `--key` | `mewmew` | API key clients must send. Fine for localhost, change it when binding beyond loopback |
 | `RATE_LIMIT` / `--rate-limit` | `30` | Max requests per second per client IP |
+| `BUDGET_REQUESTS_PER_HOUR` | `300` | **Anti-ban pacing.** Upstream requests per hour **per AutoClaw account** — keyed on the JWT's `user_id`, so the app's hourly token rotation does not reset it. Warns at 80%, answers `429 budget_exceeded` at 100% without touching upstream. `0` disables. See [Account safety](#account-safety) |
+| `GLMP_MIN_GAP_MS` | `250` | Minimum gap between upstream calls, jittered ±40% with arrival order preserved. Breaks robotic sub-10 ms bursts without feeling like latency. `0` disables |
+| `GOVERNOR_PERSIST` | on | Set to `0` to stop carrying the pacing window across restarts. On by default: a crash should not hand the account a fresh hourly budget |
 | `MAX_MESSAGES` / `--max-messages` | unlimited (`0`/unset) | Max message/entity limit in request payload (explicit values: 128, 256, 512, 1024). Leave unlimited if your harness compresses or batches history, raise it if you hit `413 / payload too large` |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `silent` |
 | `PREFER_LOCAL` | off | Set to `1` to use the local AutoClaw gateway first, skipping cloud attempts |
@@ -269,6 +274,7 @@ glmproxy --test-models
 | `--anthropic` | — | Run in Anthropic API format |
 | `--openai` | — | Run in OpenAI API format (default) |
 | `--limit [n]` | — | Set or clear the max message/entity limit (e.g. `--limit 256`; bare `--limit` prints the current value) |
+| `--budget [n]` | — | Set or clear the hourly account budget (e.g. `--budget 600`; bare `--budget` prints the current value, `--budget 0` disables pacing) |
 | `--doctor` | — | Scan AutoClaw's current runtime model catalog and show Anthropic routing |
 | `--test-models` / `--test` | — | Live health check: test every catalog model through the full pipeline |
 | `--stop` | — | Kill any other running glmproxy instances (npm-global or `bin/cli.js` starts) and exit |
@@ -324,6 +330,9 @@ Every failure maps to a semantically correct status with a machine-readable `cod
 | Bad client input (bad JSON / oversized / wrong Content-Type) | `400` / `413` / `415` | `invalid_request` |
 | Model out of credits or free quota (upstream 402/403/810000) | `402` | `quota_exhausted` |
 | Free-tier capacity throttle, "high demand" (upstream 403/810002) | `429` | `upstream_busy` |
+| Hourly account budget reached (`BUDGET_REQUESTS_PER_HOUR`) | `429` + `Retry-After` | `budget_exceeded` |
+| Upstream is throttling this account — proxy is backing off | `429` + `Retry-After` | `upstream_backoff` |
+| Account banned upstream (403/410004) | `403` | `account_quarantined` |
 | AutoClaw token expired | `401` | `token_expired` |
 | Model unknown upstream | `404` | `model_not_found` |
 | Upstream rate limit | `429` | `rate_limited_by_upstream` |
@@ -332,6 +341,60 @@ Every failure maps to a semantically correct status with a machine-readable `cod
 | Upstream timeout (default 2 min, see `UPSTREAM_TIMEOUT_MS`) | `504` | `upstream_timeout` |
 
 Quota errors are remembered for 60s per model, so repeat requests fail instantly instead of replaying doomed cloud and fallback attempts.
+
+</details>
+
+<details>
+<summary><h2>Account safety</h2></summary>
+
+**Read this before pointing an autonomous harness at this proxy.**
+
+AutoClaw bans accounts for *velocity*, not for using an API. The ban reports that
+motivated this feature all look the same: an unsupervised agent loop pushing
+thousands of credits per hour through one account, then `403` + `410004`
+("account banned"). The account is gone, and no amount of header fidelity brings
+it back.
+
+So the proxy paces itself by default. It keeps a **sliding one-hour request
+budget per AutoClaw account**, keyed on the `user_id` claim inside your JWT —
+not on the token string (the app rotates the token hourly, and a key that drifted
+per rotation would quietly reset the budget up to 24 times a day), and not on
+your IP (one account behind many IPs is still one account).
+
+| What happens | What you see |
+|---|---|
+| You cross 80% of the hourly budget | A terminal notice + a log warning, once per window |
+| You reach 100% | `429` `budget_exceeded` with a `Retry-After` header. **Nothing is sent upstream** — no credits are spent |
+| Upstream throttles you (429, or the free-tier "high demand" `810002`) | Exponential backoff with jitter; the retry is held instead of making it worse |
+| Upstream says `410004` (banned) | `403` `account_quarantined`, and upstream calls pause. A ban is permanent for that account — retrying cannot fix it |
+
+Defaults, and what they mean:
+
+```bash
+BUDGET_REQUESTS_PER_HOUR=300   # the default. A guess, deliberately low.
+GLMP_MIN_GAP_MS=250            # break robotic bursts, stay imperceptible
+BUDGET_REQUESTS_PER_HOUR=0     # disable pacing entirely (you are on your own)
+```
+
+**300 requests/hour is a documented guess, not a measured threshold.** The
+upstream does not publish its ban trigger and this project will not pretend to
+know it. 300/h sits far below any plausible interactive envelope (a human on a
+coding harness makes single-digit requests per minute in bursts) while staying
+above casual chat, and erring low is the only safe direction for a safety net.
+If your workflow legitimately needs more, raise it — `glmproxy --budget 600` or
+the env var — but raise it on purpose rather than by accident.
+
+`glmproxy --doctor` shows the current burst, the governor state, which account
+the budget is keyed to, and when your token expires. `glmproxy --test-models`
+and `--doctor` sweeps are exempt from the budget (counted separately) so a
+health check can never be blocked by the pacing — or push your account over the
+edge the pacing exists to protect.
+
+What this deliberately does **not** do: rotate identities, randomize TLS
+fingerprints, pool other people's accounts, or create accounts. Those are
+evasion, not parity, and they turn "using my own account carefully" into
+"defrauding a service". Pacing is the honest fix; the rest of this proxy's
+parity work is about looking like the client it is, not like a different client.
 
 </details>
 

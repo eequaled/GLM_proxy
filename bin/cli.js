@@ -9,14 +9,14 @@ import { spawnSync } from "child_process";
 import {
   getModelCatalog, loadConfig, createTokenLayer,
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
-  getLocalGatewayToken, getIdentityLayer, COLORS,
+  getLocalGatewayToken, getIdentityLayer, getPacingGovernor, COLORS,
 } from "../lib/core.js";
 import { DEFAULT_PORTS, DEFAULT_HOST, DEFAULT_PROXY_KEY, TEST_PROXY_PORT } from "../lib/constants.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 
-const FLAGS = ["--anthropic", "--openai", "--port", "--host", "--key", "--rate-limit", "--max-messages", "--doctor", "--test-models", "--test", "--limit", "--stop", "--help", "-h"];
+const FLAGS = ["--anthropic", "--openai", "--port", "--host", "--key", "--rate-limit", "--max-messages", "--doctor", "--test-models", "--test", "--limit", "--budget", "--stop", "--help", "-h"];
 
 // Current effective MAX_MESSAGES env value as a finite number, or Infinity.
 function effectiveMaxMessages() {
@@ -29,6 +29,19 @@ function effectiveMaxMessages() {
 function formatMaxMessages() {
   const n = effectiveMaxMessages();
   return Number.isFinite(n) ? `${n} entries` : "unlimited";
+}
+
+// Current effective hourly account budget. 0 means the governor is off.
+function effectiveBudget() {
+  const raw = process.env.BUDGET_REQUESTS_PER_HOUR;
+  if (raw === undefined || raw === "") return 300;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function formatBudget() {
+  const n = effectiveBudget();
+  return n > 0 ? `${n} requests/hour` : "off — upstream requests are unmetered";
 }
 
 function showHelp() {
@@ -52,10 +65,17 @@ function showHelp() {
     --test-models         Test all configured models against upstream and show live health
     --stop                Kill any other running glmproxy instances and exit
     --limit               Set or clear the max entity / messages limit (own menu item)
+    --budget [n]          Set or clear the hourly account budget (anti-ban pacing; 0 = off)
     --help, -h            Show this help message
 
   Environment:
     MAX_MESSAGES      Max messages limit per request (0/unset = unlimited; or 128, 256, 512, 1024)
+    BUDGET_REQUESTS_PER_HOUR
+                      Upstream requests per hour, per AutoClaw account (default: 300; 0 = off).
+                      The anti-ban guard: warns at 80%, answers 429 budget_exceeded at 100%.
+    GLMP_MIN_GAP_MS   Minimum gap between upstream calls, jittered (default: 250; 0 = off)
+    GOVERNOR_PERSIST=0
+                      Do not carry the budget window across restarts
     PREFER_LOCAL=1    Skip cloud attempts when the local AutoClaw gateway is up
     TRUSTED_PROXIES   Comma-separated IPs whose X-Forwarded-For header is trusted
   `);
@@ -115,6 +135,11 @@ async function runModelTests() {
     LOG_LEVEL: "silent",
     REQUEST_LOG_FILE: testEnvLog,
     JSONL_FILE: testEnvJsonl,
+    // Operator-initiated sweep: exempt from the account budget (the governor
+    // still counts it in a separate diagnostics bucket) so a health scan can
+    // neither be blocked by the pacing nor push the account over the edge it
+    // exists to protect. Without this, a full sweep would spend the real budget.
+    GLMP_DIAGNOSTIC: "1",
   };
 
   const { spawn } = await import("child_process");
@@ -286,6 +311,37 @@ async function runDoctor() {
       console.log(`  ${COLORS.YELLOW}⚠ identity drift: sending ${identity.knownDrift.localVersion}, remote advertises ${identity.knownDrift.remoteVersion}${COLORS.RESET}`);
     }
   } catch (_) { /* identity freshness is diagnostic only */ }
+
+  // Pacing governor (Requirements 3.5, 3.11): which account the budget is keyed
+  // to, how much of the hour is spent, and when the token expires. Derived from
+  // decoded claims only — the token itself is never printed.
+  try {
+    const governor = getPacingGovernor(
+      config,
+      { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      { getToken: () => jwt },
+    );
+    const info = governor.accountInfo();
+
+    if (info.key === "unknown" && !jwt) {
+      console.log(`  Governor: ${formatBudget()} · no AutoClaw token to key the account on`);
+    } else {
+      const burn = info.pctBudget != null
+        ? `${info.windowRequests}/${info.budget} requests this hour (${info.pctBudget}%)`
+        : `${info.windowRequests} requests (budget off)`;
+      const guest = info.isGuest ? " (guest)" : "";
+      console.log(`  Governor: ${info.state} · ${burn} · account ${info.key}${guest}`);
+      if (info.exp) {
+        const hours = (info.exp * 1000 - Date.now()) / 3_600_000;
+        const expired = hours < 0;
+        const lifetime = info.lifetimeSeconds ? `${Math.round(info.lifetimeSeconds / 3600)}h token` : "token";
+        console.log(`  ${expired ? COLORS.YELLOW : ""}Token   : ${lifetime} · expires ${expired ? "already (re-capture while logged in)" : `in ${hours.toFixed(1)}h`}${expired ? COLORS.RESET : ""}`);
+      }
+      if (info.diagnosticRequests) {
+        console.log(`  Sweeps  : ${info.diagnosticRequests} budget-exempt diagnostic request(s) this session`);
+      }
+    }
+  } catch (_) { /* governor reporting is diagnostic only */ }
   console.log("");
 }
 
@@ -380,6 +436,19 @@ if (args.includes("--limit")) {
   process.exit(0);
 }
 
+// --budget: set or clear the hourly account budget, then exit.
+if (args.includes("--budget")) {
+  const budgetIdx = args.indexOf("--budget");
+  const value = args[budgetIdx + 1];
+  if (value && /^\d+$/.test(value)) {
+    process.env.BUDGET_REQUESTS_PER_HOUR = value;
+  }
+  console.log(`\n  Hourly account budget: ${formatBudget()}`);
+  console.log(`  ${COLORS.GRAY}(Anti-ban pacing: warns at 80%, refuses upstream calls at 100%.`);
+  console.log(`   Set BUDGET_REQUESTS_PER_HOUR to apply it to a proxy run; 0 disables the governor.)${COLORS.RESET}\n`);
+  process.exit(0);
+}
+
 // Flag parsing
 let isAnthropic = args.includes("--anthropic");
 const portIdx = args.indexOf("--port");
@@ -416,6 +485,7 @@ if (!hasFlags && process.stdin.isTTY) {
         { name: "Start OpenAI Gateway (/v1/chat/completions)", value: "start_openai" },
         { name: "Start Anthropic Gateway (/v1/messages)", value: "start_anthropic" },
         { name: "Set Max Messages Limit (default: unlimited)", value: "limit" },
+        { name: "Set Hourly Account Budget (anti-ban pacing)", value: "budget" },
         { name: "Run Model Doctor (View catalog & routing)", value: "doctor" },
         { name: "Test Models (Live proxy health check)", value: "test_models" },
       ],
@@ -461,6 +531,23 @@ if (!hasFlags && process.stdin.isTTY) {
       });
       process.env.MAX_MESSAGES = entityLimit === "unlimited" ? "" : entityLimit;
       console.log(`  ${COLORS.GRAY}(If you have a compression system, leaving this unlimited is preferred.)${COLORS.RESET}\n`);
+      continue;
+    }
+
+    if (action === "budget") {
+      const entityBudget = await promptSelect({
+        message: "Hourly upstream budget per account:",
+        hint: `  ${COLORS.GRAY}current: ${formatBudget()} — this is the guard against burning the account into a ban${COLORS.RESET}`,
+        choices: [
+          { name: "300 requests/hour (default)", value: "300" },
+          { name: "600 requests/hour (heavy harness use)", value: "600" },
+          { name: "1000 requests/hour (aggressive)", value: "1000" },
+          { name: "Off — unmetered (0)", value: "0" },
+        ],
+        default: "300",
+      });
+      process.env.BUDGET_REQUESTS_PER_HOUR = entityBudget;
+      console.log(`  ${COLORS.GRAY}Pacing: ${formatBudget()}. Warns at 80%, refuses at 100% with a local 429.${COLORS.RESET}\n`);
       continue;
     }
 
