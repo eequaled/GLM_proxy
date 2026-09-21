@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import http2 from "node:http2";
+import https from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -21,13 +22,20 @@ export function createMockUpstream(initialScenario = {}) {
     allowHTTP1: true,
   };
 
-  if (scenario.alpn === "h1-only") {
-    serverOptions.ALPNProtocols = ["http/1.1"];
-  } else {
+  // `alpn: "h1-only"` must model a genuinely HTTP/1.1-only edge. Node's http2
+  // secure server computes its own ALPN list from `allowHTTP1`, so an
+  // `ALPNProtocols: ["http/1.1"]` override does NOT stop it negotiating h2 —
+  // which would make an "h1-only" scenario silently test nothing. A plain https
+  // server is the honest simulation, and it exercises the transport's real
+  // fallback path instead of a case that never occurs.
+  const h1Only = scenario.alpn === "h1-only";
+  if (!h1Only) {
     serverOptions.ALPNProtocols = ["h2", "http/1.1"];
   }
 
-  const server = http2.createSecureServer(serverOptions);
+  const server = h1Only
+    ? https.createServer({ key, cert })
+    : http2.createSecureServer(serverOptions);
 
   server.on("secureConnection", () => {
     connectionCount++;

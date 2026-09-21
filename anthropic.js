@@ -29,7 +29,7 @@ import {
   classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
   shouldFallbackToLocal, createPermanentFailureCache,
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
-  getClientHeaders, startIdentityWatch, VERSION,
+  getClientHeaders, startIdentityWatch, installShutdownHooks, VERSION,
 } from "./lib/core.js";
 
 // Config (per-format log filenames come from `format`)
@@ -54,6 +54,9 @@ startWatch();
 startBucketSweep();
 // Identity hot-reload + the hourly pinned-identity notice (lib/identity.js).
 startIdentityWatch(config, log);
+// Ctrl+C / `glmproxy --stop` release the h2 session, the keep-alive sockets and
+// the identity watchers instead of leaving them to the OS.
+installShutdownHooks(config, log);
 
 // ─── Credit-tier routing ────────────────────────────────────────────────────
 // Heuristic tiers apply immediately (startup never blocks on the network);

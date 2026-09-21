@@ -32,7 +32,7 @@ import {
   logUpstreamErrorBody, callUpstreamWithInvalidRequestRetry,
   callUpstreamOpenAI, streamLocalGatewayAgent, getLocalGatewayToken,
   classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
-  shouldFallbackToLocal, createPermanentFailureCache, getClientHeaders, startIdentityWatch, VERSION,
+  shouldFallbackToLocal, createPermanentFailureCache, getClientHeaders, startIdentityWatch, installShutdownHooks, VERSION,
 } from "./lib/core.js";
 
 // Config
@@ -58,6 +58,9 @@ startWatch();
 startBucketSweep();
 // Identity hot-reload + the hourly pinned-identity notice (lib/identity.js).
 startIdentityWatch(config, log);
+// Ctrl+C / `glmproxy --stop` release the h2 session, the keep-alive sockets and
+// the identity watchers instead of leaving them to the OS.
+installShutdownHooks(config, log);
 
 // SSE buffering (OpenAI-specific: assemble streamed chunks into a single response)
 function bufferSSE(upstreamRes, modelId) {
