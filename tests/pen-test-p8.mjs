@@ -87,6 +87,13 @@ check("h1: sends the User-Agent the real client sends (undici stack default, not
 check("h1: sends the Accept the app sets (`*/*`)", h1Headers["accept"] === "*/*", h1Headers["accept"]);
 check("h1: identity overlay reaches the wire (X-Version from the app runtime file)",
   h1Headers["x-version"] === VERSION, h1Headers["x-version"]);
+// The upstream's system-prompt allowlist accepts this declaration on its own
+// (probe-verified 2026-09-21), which is what keeps the pinned banner from being
+// a single point of failure. If it ever stops being sent, the watermark is
+// load-bearing again — that is a regression worth failing on.
+check("h1: declares the harness the app declares, so the prompt gate opens on its own",
+  h1Headers["x-harness-type"] === "zcode" && h1Headers["x_trace_id"] === "autoclaw-desktop",
+  `${h1Headers["x-harness-type"]} / ${h1Headers["x_trace_id"]}`);
 check("h1: never advertises an encoding it cannot decode",
   !h1Headers["accept-encoding"] || h1Headers["accept-encoding"] === "identity",
   h1Headers["accept-encoding"]);

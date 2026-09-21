@@ -257,6 +257,27 @@ check("fallback catalog ships six models incl glm-5.3-flash", () => {
   assert.ok(cfg.FALLBACK_MODELS.some((m) => m.id === "zai_glm-5.3-flash"));
 });
 
+// The harness declaration the upstream's prompt allowlist accepts, and the switch
+// that turns it off. Measured from the app bundle; probe-verified against the
+// live upstream (tests/experiments/harness-type-probe.mjs).
+check("client headers declare the harness the app declares", () => {
+  const cfg = loadConfig({ format: "openai" });
+  assert.equal(cfg.CLIENT_HEADERS["X-Harness-Type"], "zcode");
+  assert.equal(cfg.CLIENT_HEADERS.x_trace_id, "autoclaw-desktop");
+});
+
+check("GLMP_HARNESS_TYPE= (empty) sends no harness declaration at all", () => {
+  const prev = process.env.GLMP_HARNESS_TYPE;
+  process.env.GLMP_HARNESS_TYPE = "";
+  try {
+    const cfg = loadConfig({ format: "openai" });
+    assert.equal(cfg.CLIENT_HEADERS["X-Harness-Type"], undefined);
+    assert.equal(cfg.CLIENT_HEADERS.x_trace_id, undefined);
+  } finally {
+    if (prev === undefined) delete process.env.GLMP_HARNESS_TYPE; else process.env.GLMP_HARNESS_TYPE = prev;
+  }
+});
+
 check("FALLBACK_MODELS_PATH override is honored", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "glmproxy-fb-"));
   fs.writeFileSync(path.join(tmp, "models.json"), JSON.stringify({ models: [{ id: "custom-model", name: "Custom" }] }));
