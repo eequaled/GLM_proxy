@@ -21,7 +21,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { PEN_TEST_PORTS } from "../lib/constants.js";
-import { classifyGovernorError } from "../lib/core.js";
+import { classifyGovernorError, getConfigHeartbeat, getPacingGovernor } from "../lib/core.js";
 import {
   BACKOFF_BASE_MS,
   BACKOFF_MAX_MS,
@@ -38,6 +38,15 @@ const HOUR = 60 * 60 * 1000;
 
 function checkThat(name, fn) {
   try { fn(); check(name, true); }
+  catch (e) { check(name, false, e.message); }
+}
+
+// Async cases get their own wrapper. `checkThat` cannot see a rejected promise,
+// so an `await`-ing case handed to it reports a pass the instant it is called
+// and only fails later, as an unhandled rejection — a green line for a red
+// property, which is the one thing a pen test must never do.
+async function checkThatAsync(name, fn) {
+  try { await fn(); check(name, true); }
   catch (e) { check(name, false, e.message); }
 }
 
@@ -378,7 +387,7 @@ checkThat("backoff: a ban quarantines the account instead of throttling it", () 
 
 // ── 6. dispatch gaps (R3.6) ─────────────────────────────────────────────────
 
-checkThat("gap: back-to-back dispatches wait out the gap without reordering", async () => {
+await checkThatAsync("gap: back-to-back dispatches wait out the gap without reordering", async () => {
   const slept = [];
   const clock = fakeClock();
   const { governor } = makeGovernor({
@@ -408,7 +417,7 @@ checkThat("gap: back-to-back dispatches wait out the gap without reordering", as
   assert.deepEqual(waits, ordered, "arrival order was not preserved");
 });
 
-checkThat("gap: 0 disables the pacing delay", async () => {
+await checkThatAsync("gap: 0 disables the pacing delay", async () => {
   const { governor } = makeGovernor({ budget: 100, gap: 0 });
   assert.equal(await governor.waitForGap("user:13"), 0);
   assert.equal(await governor.waitForGap("user:13"), 0);
@@ -471,7 +480,88 @@ checkThat("taxonomy: the other two governor verdicts keep their own shape", () =
   assert.equal(quarantined.permanent, true);
 });
 
-// ── 9. end-to-end: over budget never opens an upstream socket (R3.2) ────────
+// ── 9. the ban-lift probe (Task 7a, R6.2) ───────────────────────────────────
+//
+// A ban signal quarantines the account, and quarantine is terminal until
+// something lifts it. It must not be a one-way door: bans do get lifted, and
+// the stale-identity false positive is a real failure class. The config poll is
+// the cheap detector — a GET costs nothing and, unlike a completion, spending
+// it tells us nothing about whether the account is back — so the heartbeat's
+// healthy path is what lifts it. That is also why the cadence stretches but
+// never stops while the governor has us paused (R5.4).
+//
+// These cases drive the REAL wiring: core.js's getConfigHeartbeat defaults, with
+// the payload injected so no socket is opened and no credit is spent.
+
+const BAN_403 = JSON.stringify({ code: 410004, message: "账号已被封禁" });
+
+function liftHarness() {
+  const token = jwtFor(REAL_CLAIMS);
+  let payload = null;
+  // A unique host per harness: both getPacingGovernor and getConfigHeartbeat
+  // memoize by config, and an instance leaked from a previous case would hide
+  // exactly the bug the next case exists to catch.
+  const config = {
+    UPSTREAM_HOST: `p7-lift-${Math.random().toString(16).slice(2)}`,
+    BUDGET_REQUESTS_PER_HOUR: 50,
+    MIN_GAP_MS: 0,
+    STATE_DIR: tempStateDir(),
+    HEARTBEAT_INTERVAL_MS: 300_000,
+  };
+  const cap = capturingLog();
+  const governor = getPacingGovernor(config, cap.log, { getToken: () => token, sleep: async () => {} });
+  const heartbeat = getConfigHeartbeat(config, cap.log, {
+    getToken: () => token,
+    fetchConfig: async () => payload,
+  });
+  return {
+    config, cap, governor, heartbeat,
+    setPayload: (p) => { payload = p; },
+    quarantine: () => governor.recordUpstreamSignal(null, 403, BAN_403),
+  };
+}
+
+await checkThatAsync("lift: a healthy config poll lifts the quarantine a ban signal set", async () => {
+  const h = liftHarness();
+  assert.equal(h.quarantine().state, "quarantined", "the ban signal should have quarantined the account");
+  assert.equal(h.governor.state().state, "quarantined", "the account should start quarantined");
+
+  h.setPayload([{ id: "zai_glm-5.3-flash" }]);
+  h.heartbeat.start();
+  await h.heartbeat.pollNow();
+  h.heartbeat.stop();
+
+  assert.equal(h.governor.state().state, "normal", "a 200 from the config poll must lift the quarantine");
+  assert.match(h.cap.text(), /quarantine lifted/, "the lift must be announced in the log");
+  assert.equal(h.governor.tryAcquire().ok, true, "upstream calls must resume once the quarantine is lifted");
+});
+
+await checkThatAsync("lift: a failed poll leaves the quarantine in place", async () => {
+  const h = liftHarness();
+  h.quarantine();
+
+  h.setPayload(null); // no payload: the poll failed, so nothing was proven
+  h.heartbeat.start();
+  await h.heartbeat.pollNow();
+  h.heartbeat.stop();
+
+  assert.equal(h.governor.state().state, "quarantined", "a failed poll proves nothing and must not lift a ban");
+  assert.doesNotMatch(h.cap.text(), /quarantine lifted/);
+});
+
+await checkThatAsync("lift: an empty catalog is a failed poll, not a healthy one", async () => {
+  const h = liftHarness();
+  h.quarantine();
+
+  h.setPayload([]); // 200 with nothing usable in it: the account answered, but not with a config
+  h.heartbeat.start();
+  await h.heartbeat.pollNow();
+  h.heartbeat.stop();
+
+  assert.equal(h.governor.state().state, "quarantined", "an unusable payload must not be read as a healthy account");
+});
+
+// ── 10. end-to-end: over budget never opens an upstream socket (R3.2) ───────
 
 {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "glmp-p7-home-"));
