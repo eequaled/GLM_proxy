@@ -211,6 +211,43 @@ checkThat("budget: 0 disables enforcement entirely and says so", () => {
   assert.match(cap.text(), /disabled/i);
 });
 
+checkThat("off: a disabled governor meters nothing and writes no state at all", () => {
+  const stateDir = tempStateDir();
+  const { governor } = makeGovernor({ budget: 0, stateDir });
+  const key = "user:16";
+
+  for (let i = 0; i < 50; i++) assert.equal(governor.tryAcquire(key).ok, true);
+  governor.tryAcquire(key, { diagnostic: true });
+  governor.recordUsage(key, { total_tokens: 12345 });
+  governor.recordUpstreamSignal(key, 429, "throttled");
+
+  assert.equal(governor.state(key).windowRequests, 0, "requests made while off are not counted");
+  assert.equal(governor.state(key).diagnosticRequests, 0, "diagnostics are not counted while off");
+  assert.equal(
+    fs.existsSync(path.join(stateDir, GOVERNOR_STATE_FILE)), false,
+    "a disabled governor must not leave state behind — the file would masquerade as an enforced window on the next start",
+  );
+
+  // Off stops the metering, not the reflexes: an upstream throttle still
+  // engages the in-process backoff, because that is upstream's own pacing
+  // signal rather than ours. Nothing of it is persisted.
+  const held = governor.tryAcquire(key);
+  assert.equal(held.ok, false);
+  assert.equal(held.reason, "upstream_backoff");
+});
+
+checkThat("off: turning the governor back on starts from a clean window", () => {
+  const { governor } = makeGovernor({ budget: 0 });
+  const key = "user:17";
+
+  for (let i = 0; i < 100; i++) governor.tryAcquire(key);
+  governor.setBudget(3);
+
+  assert.equal(governor.state(key).windowRequests, 0, "the off-era requests must not count against the new budget");
+  for (let i = 0; i < 3; i++) assert.equal(governor.tryAcquire(key).ok, true);
+  assert.equal(governor.tryAcquire(key).reason, "budget_exceeded");
+});
+
 // ── 3. the 80% notice (R3.3) ────────────────────────────────────────────────
 
 checkThat("notice: crossing 80% warns once, in the log and as a TUI notice", () => {
