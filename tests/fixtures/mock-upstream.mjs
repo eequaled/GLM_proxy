@@ -3,10 +3,50 @@ import http2 from "node:http2";
 import https from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_KEY = path.join(DIR, "certs", "key.pem");
 const DEFAULT_CERT = path.join(DIR, "certs", "cert.pem");
+
+// The SSE body a plain 200 streams, as one string. The compressed path needs the
+// whole payload before it can encode it, so the same text has to exist as a
+// value rather than only as a sequence of res.write() calls.
+function sseText(scenario) {
+  const id = "chatcmpl-mock-123";
+  const model = "zai_glm-5.3-flash";
+  return [
+    `data: ${JSON.stringify({ id, model, choices: [{ delta: { role: "assistant", content: "Hello" } }] })}\n\n`,
+    `data: ${JSON.stringify({ id, model, choices: [{ delta: { content: " from mock" } }] })}\n\n`,
+    `data: ${JSON.stringify({ id, model, choices: [{ delta: {}, finish_reason: "stop" }], usage: scenario.usage || { prompt_tokens: 10, completion_tokens: 5 } })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+}
+
+/**
+ * Encode a body the way a real intermediary would.
+ *
+ * `deflate-raw` models the servers that send RFC 1951 deflate with no RFC 1950
+ * zlib wrapper — the ambiguity lib/decode.js sniffs for, and the case a naive
+ * decoder fails mid-stream on. An unknown token is deliberately passed through
+ * verbatim so a scenario can prove the proxy fails loudly instead of serving
+ * the bytes to the client as if they were text.
+ */
+export function compressBody(text, encoding) {
+  const buf = Buffer.from(text, "utf8");
+  switch (encoding) {
+    case "gzip": return zlib.gzipSync(buf);
+    case "br": return zlib.brotliCompressSync(buf);
+    case "deflate": return zlib.deflateSync(buf);
+    case "deflate-raw": return zlib.deflateRawSync(buf);
+    default: return buf;
+  }
+}
+
+// `deflate-raw` is still advertised as plain `deflate`: no server says "raw".
+function encodingHeader(encoding) {
+  return encoding === "deflate-raw" ? "deflate" : encoding;
+}
 
 export function createMockUpstream(initialScenario = {}) {
   let scenario = { ...initialScenario };
@@ -61,6 +101,30 @@ export function createMockUpstream(initialScenario = {}) {
       // Handle scenario override or default routing
       const url = req.url || "/";
 
+      // Every mocked response funnels through here, so a scenario can ask for
+      // its body to be compressed without any other case changing shape.
+      const sendBody = (status, headers, bodyText) => {
+        if (!scenario.encode) {
+          res.writeHead(status, headers);
+          res.end(bodyText);
+          return;
+        }
+        const encoded = compressBody(bodyText, scenario.encode);
+        res.writeHead(status, {
+          ...headers,
+          "content-encoding": encodingHeader(scenario.encode),
+          vary: "accept-encoding",
+        });
+        if (scenario.truncateEncoded) {
+          // Half a member, then the socket dies — the case that hangs a
+          // consumer with no error listener on the decode chain.
+          res.write(encoded.subarray(0, Math.max(1, Math.floor(encoded.length / 2))));
+          setTimeout(() => { try { res.socket.destroy(); } catch (_) { /* already gone */ } }, 20);
+          return;
+        }
+        res.end(encoded);
+      };
+
       // Remote model config endpoint
       if (url.includes("/autoclaw-model-config")) {
         res.writeHead(scenario.modelConfigStatus || 200, {
@@ -78,8 +142,7 @@ export function createMockUpstream(initialScenario = {}) {
       // Free-tier capacity throttle: 403 + 810002 with "kind":"pay-view". The
       // account is fine; the free tier is busy. Measured live 2026-09-21.
       if (scenario.payview) {
-        res.writeHead(403, { "content-type": "application/json" });
-        res.end(JSON.stringify({
+        sendBody(403, { "content-type": "application/json" }, JSON.stringify({
           action: { kind: "pay-view" },
           code: 810002,
           image_url: "https://example.invalid/high-demand.png",
@@ -90,22 +153,20 @@ export function createMockUpstream(initialScenario = {}) {
 
       // Ban scenario
       if (scenario.ban || scenario.status === 403) {
-        res.writeHead(403, {
+        sendBody(403, {
           "content-type": "application/json",
           ...(scenario.cookie ? { "set-cookie": scenario.cookie } : {}),
-        });
-        res.end(JSON.stringify({ code: 410004, message: "账号已被封禁" }));
+        }, JSON.stringify({ code: 410004, message: "账号已被封禁" }));
         return;
       }
 
       // Throttling 429 scenario
       if (scenario.throttle || scenario.status === 429) {
-        res.writeHead(429, {
+        sendBody(429, {
           "content-type": "application/json",
           "retry-after": String(scenario.retryAfter || "2"),
           ...(scenario.cookie ? { "set-cookie": scenario.cookie } : {}),
-        });
-        res.end(JSON.stringify({ code: 429001, message: "Rate limit exceeded" }));
+        }, JSON.stringify({ code: 429001, message: "Rate limit exceeded" }));
         return;
       }
 
@@ -117,20 +178,17 @@ export function createMockUpstream(initialScenario = {}) {
         ...(scenario.headers || {}),
       };
 
-      res.writeHead(status, headers);
-
-      if (scenario.sse !== false && status === 200) {
-        // Stream standard completion SSE chunks
-        const id = "chatcmpl-mock-123";
-        const model = "zai_glm-5.3-flash";
-        res.write(`data: ${JSON.stringify({ id, model, choices: [{ delta: { role: "assistant", content: "Hello" } }] })}\n\n`);
-        res.write(`data: ${JSON.stringify({ id, model, choices: [{ delta: { content: " from mock" } }] })}\n\n`);
-        res.write(`data: ${JSON.stringify({ id, model, choices: [{ delta: {}, finish_reason: "stop" }], usage: scenario.usage || { prompt_tokens: 10, completion_tokens: 5 } })}\n\n`);
-        res.write("data: [DONE]\n\n");
+      if (scenario.sse !== false && status === 200 && !scenario.encode) {
+        // Stream standard completion SSE chunks, incrementally, exactly as the
+        // real upstream does (uncompressed = the ordinary path).
+        res.writeHead(status, headers);
+        for (const piece of sseText(scenario).split("\n\n").slice(0, -1)) res.write(`${piece}\n\n`);
         res.end();
       } else {
-        const bodyContent = typeof scenario.body === "object" ? JSON.stringify(scenario.body) : (scenario.body || "OK");
-        res.end(bodyContent);
+        const bodyContent = scenario.sse !== false && status === 200
+          ? sseText(scenario)
+          : (typeof scenario.body === "object" ? JSON.stringify(scenario.body) : (scenario.body || "OK"));
+        sendBody(status, headers, bodyContent);
       }
     });
   });

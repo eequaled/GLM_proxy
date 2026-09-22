@@ -16,6 +16,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { PEN_TEST_PORTS } from "../lib/constants.js";
+import { DEFAULT_ACCEPT_ENCODING, SUPPORTED_ENCODINGS } from "../lib/decode.js";
 import {
   createConfigHeartbeat, DEFAULT_INTERVAL_MS, MAX_BACKOFF_MS, JITTER_RATIO,
   fingerprintModels, describeModelChange,
@@ -98,9 +99,15 @@ check("h1: identity overlay reaches the wire (X-Version from the app runtime fil
 check("h1: declares the harness the app declares, so the prompt gate opens on its own",
   h1Headers["x-harness-type"] === "zcode" && h1Headers["x_trace_id"] === "autoclaw-desktop",
   `${h1Headers["x-harness-type"]} / ${h1Headers["x_trace_id"]}`);
-check("h1: never advertises an encoding it cannot decode",
-  !h1Headers["accept-encoding"] || h1Headers["accept-encoding"] === "identity",
-  h1Headers["accept-encoding"]);
+// A2: the advert mirrors the measured client exactly, and it stays truthful
+// because lib/decode.js decodes precisely this set. An encoding advertised and
+// NOT decodable is the one outcome this whole change exists to prevent.
+check("h1: advertises exactly the encodings the real client sends",
+  h1Headers["accept-encoding"] === "br, gzip, deflate", h1Headers["accept-encoding"]);
+check("h1: and every advertised encoding is one it can actually decode",
+  DEFAULT_ACCEPT_ENCODING.split(",").map((t) => t.trim())
+    .every((t) => SUPPORTED_ENCODINGS.includes(t)),
+  DEFAULT_ACCEPT_ENCODING);
 check("h1: first touch carries no cookie (no jar yet)", !h1Headers["cookie"], h1Headers["cookie"]);
 
 // ---- 2. WAF cookie: stored from Set-Cookie and echoed afterwards ------------
@@ -166,7 +173,8 @@ check("h2: hop-by-hop headers are never sent (RFC 7540 §8.1.2.2)",
   !("connection" in h2Headers) && !("keep-alive" in h2Headers) && !("host" in h2Headers),
   ["connection", "keep-alive", "host"].filter((k) => k in h2Headers).join(","));
 check("h2: identity headers still ride along", h2Headers["x-version"] === VERSION, h2Headers["x-version"]);
-check("h2: no Accept-Encoding advertised either", !h2Headers["accept-encoding"], h2Headers["accept-encoding"]);
+check("h2: the same advert rides the h2 path",
+  h2Headers["accept-encoding"] === "br, gzip, deflate", h2Headers["accept-encoding"]);
 check("h2: the client-visible response is unchanged", h2b.status === 200, h2b.status);
 
 await stopProxy(proxyD);
