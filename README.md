@@ -401,6 +401,49 @@ evasion, not parity, and they turn "using my own account carefully" into
 "defrauding a service". Pacing is the honest fix; the rest of this proxy's
 parity work is about looking like the client it is, not like a different client.
 
+Where the numbers come from, and what happened before pacing existed:
+[BAN-RISK-AND-LIMITS.md](BAN-RISK-AND-LIMITS.md), the longer write-up with the
+evidence.
+
+</details>
+
+<details>
+<summary><h2>Ban risk, and what changed since</h2></summary>
+
+Issue #5 is a ban report. One user burned 8,000+ AutoClaw credits in about two
+hours of continuous unattended harness use and was banned — in the desktop app
+too, so the ban is account-scoped, not proxy-specific. A second user reported
+the same shape.
+
+Burn velocity is the cause, ranked above any fingerprint issue. A harness loop
+with no account-level ceiling pushed thousands of requests through one account.
+
+Three upstream errors get confused, and they mean different things:
+
+| Signal | What it actually is |
+|---|---|
+| `410004 账号已被封禁`, HTTP `403` | A real account ban. Permanent for that account, and no proxy can undo it |
+| `810002` with `"kind":"pay-view"` and "high demand… upgrade to a monthly subscription for priority access", also HTTP `403` | **Not** a ban. Free-tier capacity throttling. The account is fine and retrying later works |
+| `810000` / HTTP `402` | Out of credits or free quota |
+
+Both the ban and the throttle arrive as HTTP `403`, which is exactly why the two
+get conflated.
+
+Hardened on master since, all of it currently unreleased:
+
+- Throttles and bans are now terminal for the local desktop-agent fallback. That path re-issues the same cloud call on the same account, so it used to fail identically after wasting up to 120 seconds. In one measured session that cost ~26 minutes out of 50.
+- A throttle maps to `429 upstream_busy` instead of a generic `403`, so a harness backs off instead of retrying into a wall. Throttle responses also trigger a bounded exponential backoff with jitter instead of an immediate retry.
+- An unknown-model `400` used to hang ~30 s before falling into that fallback. It is a clean `404` in about half a second now.
+- Per-account pacing is the other half of this, and it is documented under [Account safety](#account-safety).
+
+What is still unknown, and said plainly:
+
+- The upstream may impose per-minute limits and short per-model cooldowns, not only hourly ones.
+- The client can be required to sign its requests with a device-bound key that a proxy cannot reproduce. If the service turns that on, this proxy stops working, and paying a provider for API access is the honest answer.
+
+Fuller detail: [BAN-RISK-AND-LIMITS.md](BAN-RISK-AND-LIMITS.md), the longer
+write-up with the evidence.
+
 </details>
 
 <details>
