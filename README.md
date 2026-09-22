@@ -401,6 +401,17 @@ evasion, not parity, and they turn "using my own account carefully" into
 "defrauding a service". Pacing is the honest fix; the rest of this proxy's
 parity work is about looking like the client it is, not like a different client.
 
+**Why pooling several of your own accounts doesn't work either.** It sounds like
+a bigger budget, but the device identity belongs to the machine, not to the
+account: `identity\device.json` holds one `deviceId` and one Ed25519 keypair,
+created once and never rotated per account, and AutoClaw keeps exactly one token
+file (`request-headers.json`) — signing in as someone else replaces it. So every
+account you capture here reports the *same* device id, and an automatic switch to
+the second account seconds after the first is banned reads as one device routing
+around a ban rather than as resilience. The honest answer for more throughput is
+a second provider (kimi-proxy, arena2api, a local Ollama) or paying for one
+account.
+
 Where the numbers come from, and what happened before pacing existed:
 [BAN-RISK-AND-LIMITS.md](BAN-RISK-AND-LIMITS.md), the longer write-up with the
 evidence.
@@ -432,6 +443,8 @@ get conflated.
 Hardened on master since, all of it currently unreleased:
 
 - Throttles and bans are now terminal for the local desktop-agent fallback. That path re-issues the same cloud call on the same account, so it used to fail identically after wasting up to 120 seconds. In one measured session that cost ~26 minutes out of 50.
+- A quarantine is no longer a one-way door. The proxy polls the model-config endpoint every 5 minutes anyway, and a `200` from it proves the account answers again — so a ban that upstream later lifts (or a false positive) clears itself instead of waiting for someone to delete a state file. It costs a `GET`, never a completion.
+- `--doctor` prints the token window too: `24h token — expires in 45m; re-capture it while the app is logged in`. A token file that has quietly died used to read like an account problem, because upstream answers `401` for both.
 - A throttle maps to `429 upstream_busy` instead of a generic `403`, so a harness backs off instead of retrying into a wall. Throttle responses also trigger a bounded exponential backoff with jitter instead of an immediate retry.
 - An unknown-model `400` used to hang ~30 s before falling into that fallback. It is a clean `404` in about half a second now.
 - Per-account pacing is the other half of this, and it is documented under [Account safety](#account-safety).
@@ -501,7 +514,7 @@ TRUSTED_PROXIES=127.0.0.1 glmproxy --host 0.0.0.0
 <details>
 <summary><h2>Good to know</h2></summary>
 
-- Only one AutoClaw account can be active at a time, multi-account pooling isn't supported
+- Only one AutoClaw account can be active at a time, multi-account pooling isn't supported — [Account safety](#account-safety) explains why it wouldn't help anyway
 - `PROXY_KEY` is just a local password for this proxy, not your AutoClaw credentials. Set it to whatever you want. The default `mewmew` is for localhost-only use
 - On a 401, the proxy invalidates its cached token and you can retry immediately
 - Upstream 400 `"invalid request"` gets one retry after a 2s delay (a known upstream hiccup). Quota/plan errors are never retried
