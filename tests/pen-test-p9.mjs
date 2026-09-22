@@ -26,13 +26,18 @@ const PORT = PEN_TEST_PORTS.p9;
 
 // Same isolation contract as p6/p8: a throwaway HOME holding just the two app
 // artifacts the request path needs, so the real machine's state is never read.
-function makeHome() {
+function makeHome({ gateway = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glmp-p9-"));
   const appDir = path.join(dir, ".openclaw-autoclaw");
   fs.mkdirSync(appDir, { recursive: true });
   fs.writeFileSync(path.join(appDir, "request-headers.json"), JSON.stringify({
     headers: { "X-Authorization": "Bearer p9-fake-token" },
   }), "utf8");
+  // A gateway token makes the desktop-agent fallback *look available*, which is
+  // what the operator's machine looks like and what the mock otherwise hides:
+  // with no token, tryLocalAgent() returns false before it logs anything, so a
+  // fallback that should never have run stays invisible to the assertion.
+  if (gateway) fs.writeFileSync(path.join(appDir, ".gateway-token"), "p9-fake-gateway-token", "utf8");
   fs.writeFileSync(path.join(appDir, "openclaw.runtime.json"), JSON.stringify({
     models: {
       providers: {
@@ -136,6 +141,41 @@ const ask = () => post(PORT, {
     elapsed < 10_000, `${elapsed}ms`);
   check("repeat: the upstream is not hammered on the retry", mock.getRequests().length - before <= 1,
     String(mock.getRequests().length - before));
+
+  await stopProxy(proxy);
+  await mock.close();
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+// ---- 4. a throttle is terminal for the fallback even with a gateway present --
+//
+// The fallback gate used to be decided on the RAW upstream status, so a 403 that
+// means "free-tier capacity throttle" (810002 pay-view) classified to 429 for the
+// client but still marched into the desktop agent — which re-issues the same
+// cloud call against the same account and fails identically. Measured live
+// 2026-09-22: ~4 s wasted per occurrence, ~26 minutes across one operator
+// session. The mock alone cannot catch it, because with no running AutoClaw the
+// fallback short-circuits before logging anything; a gateway token makes the
+// agent available, which is exactly the operator's situation.
+{
+  const home = makeHome({ gateway: true });
+  const { mock, proxy } = await againstMock({ payview: true }, home);
+
+  const res = await ask();
+  check("throttle+gateway: the client still gets a 429 upstream_busy", res.status === 429, res.status);
+
+  let code = null;
+  try { code = JSON.parse(res.body)?.error?.code; } catch { /* asserted via status */ }
+  check("throttle+gateway: classified upstream_busy, not a local-gateway failure",
+    code === "upstream_busy", code);
+
+  const out = proxyOutput(proxy).all || "";
+  check("throttle+gateway: the local agent is never even attempted",
+    !/via local AutoClaw WebSocket agent/.test(out),
+    out.split("\n").filter((l) => /local AutoClaw WebSocket agent/.test(l)).join(" | "));
+
+  check("throttle+gateway: the upstream is still hit exactly once",
+    mock.getRequests().length === 1, String(mock.getRequests().length));
 
   await stopProxy(proxy);
   await mock.close();

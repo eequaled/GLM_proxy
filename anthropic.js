@@ -686,18 +686,27 @@ async function handleMessages(req, res) {
     // picks up the fresh JWT regardless of who serves this one.
     if (statusCode === 401) invalidateAuth();
 
-    if (shouldFallbackToLocal(statusCode)) {
+    // Failure path only — a 2xx falls through to the success renderer below.
+    if (statusCode >= 400) {
+      // Classify BEFORE deciding, and decide the fallback on the CLASSIFIED
+      // status rather than the raw one — see the long note in openai.js. In
+      // short: a raw 403 meaning "free-tier capacity throttle" (810002)
+      // classifies to 429, and 429 is terminal for the fallback, so gating on
+      // the raw status marched the throttle into the desktop agent and reported
+      // it to the client as a local-gateway failure.
       const cls = classifyUpstreamError(statusCode, upstreamErrBody, modelId);
       if (cls.permanent) permanentFailures.mark(modelId, cls);
       log.error(`Upstream error ${statusCode}:`, cls.message);
       cloudEvidence = { status: statusCode, code: cls.code };
 
-      // The desktop gateway shares this AutoClaw account — quota walls stop
-      // it too, so don't march known-permanent failures into it.
-      if (!cls.permanent || !permanentFailures.get(modelId)) {
-        if (await tryLocalAgent()) return;
-      } else {
-        log.info(`Skipping local fallback for ${modelId}: ${cls.code} is permanent`);
+      if (shouldFallbackToLocal(cls.status)) {
+        // The desktop gateway shares this AutoClaw account — quota walls stop
+        // it too, so don't march known-permanent failures into it.
+        if (!cls.permanent || !permanentFailures.get(modelId)) {
+          if (await tryLocalAgent()) return;
+        } else {
+          log.info(`Skipping local fallback for ${modelId}: ${cls.code} is permanent`);
+        }
       }
 
       record(cls.status, {

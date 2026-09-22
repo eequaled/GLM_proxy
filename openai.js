@@ -424,12 +424,20 @@ async function handleChatCompletions(req, res) {
     // request picks up the fresh JWT regardless of who serves this one.
     if (effectiveStatus === 401) invalidateAuth();
 
-    if (shouldFallbackToLocal(effectiveStatus)) {
-      const cls = classifyUpstreamError(effectiveStatus, upstreamErrBody, modelId);
-      if (cls.permanent) permanentFailures.mark(modelId, cls);
-      log.error(`Upstream error ${effectiveStatus}:`, cls.message);
-      cloudEvidence = { status: effectiveStatus, code: cls.code };
+    // Classify BEFORE deciding, and decide the fallback on the CLASSIFIED status
+    // rather than the raw one. A raw 403 that means "free-tier capacity throttle"
+    // (810002 pay-view) classifies to 429, and 429 is terminal for the fallback —
+    // gating on the raw status marched that throttle into the desktop agent,
+    // which re-issues the same cloud call against the same account and fails
+    // identically. Measured live 2026-09-22: ~4 s per occurrence, ~26 minutes
+    // across one operator session, and the throttle was reported to the client as
+    // a *local-gateway* failure instead of as the throttle it was.
+    const cls = classifyUpstreamError(effectiveStatus, upstreamErrBody, modelId);
+    if (cls.permanent) permanentFailures.mark(modelId, cls);
+    log.error(`Upstream error ${effectiveStatus}:`, cls.message);
+    cloudEvidence = { status: effectiveStatus, code: cls.code };
 
+    if (shouldFallbackToLocal(cls.status)) {
       // The desktop gateway shares this AutoClaw account — a quota/plan wall
       // stops it too, so don't march a known-permanent failure into it.
       if (!cls.permanent || !permanentFailures.get(modelId)) {
@@ -437,18 +445,18 @@ async function handleChatCompletions(req, res) {
       } else {
         log.info(`Skipping local fallback for ${modelId}: ${cls.code} is permanent`);
       }
-
-      record(cls.status, {
-        model: modelId, lastMessage: lastMsgForLog(), messageCount: body.messages?.length || 0,
-        error: cls.code,
-        // cloud evidence rides along on the terminal entry — the test CLI
-        // renders [cloud NNN → local agent] from these fields
-        ...(effectiveStatus !== cls.status ? { cloud_status: effectiveStatus, cloud_error: cls.code } : {}),
-      });
-      return sendClassifiedErrorOpenAI(res, cls);
     }
 
-    return respondSuccess(upstreamRes);
+    // Never fall through to the success path with a >=400 status: a verdict that
+    // is terminal for the fallback is still a failure the client has to see.
+    record(cls.status, {
+      model: modelId, lastMessage: lastMsgForLog(), messageCount: body.messages?.length || 0,
+      error: cls.code,
+      // cloud evidence rides along on the terminal entry — the test CLI
+      // renders [cloud NNN → local agent] from these fields
+      ...(effectiveStatus !== cls.status ? { cloud_status: effectiveStatus, cloud_error: cls.code } : {}),
+    });
+    return sendClassifiedErrorOpenAI(res, cls);
   } catch (err) {
     // Transport-level failure (no HTTP response at all): dead token, connect
     // reset, upstream timeout…
