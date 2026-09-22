@@ -130,6 +130,8 @@ AutoClaw gives you Zhipu's GLM models (GLM-5.3, GLM-5-Turbo, GLM-5.3-Flash, plus
 
 It also paces itself: a sliding hourly request budget per account keeps a runaway harness from burning your account into a ban. See [Account safety](#account-safety).
 
+-# ⚠️ <u>**A ban is not a throttle, and this proxy cannot undo one.**</u> `403` + `410004` is a real, permanent ban; `403` + `810002` "high demand" is only a capacity throttle, and the proxy retries that for you. Details: [error handling](#error-handling) · [ban risk](#ban-risk-and-what-changed-since) · [full write-up](BAN-RISK-AND-LIMITS.md)
+
 ## How it works
 
 ```
