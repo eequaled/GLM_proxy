@@ -64,9 +64,21 @@ export function proxyOutput(proc) {
   return { stdout: c.stdout, stderr: c.stderr, all: c.stdout + c.stderr };
 }
 
+// Wait for the process to actually be gone, not merely signalled.
+//
+// The old version sent SIGTERM and slept a fixed 500 ms. Under load that leaves a
+// window in which the next suite's `startProxy` on the SAME port binds to a
+// listener that is still shutting down: `waitForServer` sees a port that accepts,
+// and the first client request then fails with ECONNRESET against a process that
+// is already exiting. That surfaced as an intermittent p10 failure inside the
+// full suite while passing every time standalone.
 export async function stopProxy(proc) {
-  if (proc && !proc.killed) proc.kill("SIGTERM");
-  await sleep(500);
+  if (!proc) return;
+  if (proc.exitCode !== null || proc.signalCode !== null) return; // already gone
+  const exited = new Promise((resolve) => proc.once("exit", resolve));
+  try { proc.kill("SIGTERM"); } catch (_) { return; }
+  await Promise.race([exited, sleep(5_000)]);
+  await sleep(150); // let the OS release the listening socket
 }
 
 export function post(port, { path = "/v1/chat/completions", body, headers = {}, timeoutMs = 10000 } = {}) {
