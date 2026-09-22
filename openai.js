@@ -4,9 +4,8 @@
  * Owns ONLY the endpoint surface and wire format:
  *   POST /v1/chat/completions (+ OpenAI SSE passthrough / non-stream assembly)
  *   GET  /v1/models (OpenAI list shape)
- * All shared machinery — config, tokens, catalog, upstream calls, the local
- * WebSocket fallback, error classification, logging, server bootstrap — lives
- * in lib/core.js.
+ * All shared machinery — config, tokens, catalog, upstream calls, error
+ * classification, logging, server bootstrap — lives in lib/core.js.
  *
  * How auth works: AutoClaw keeps a fresh JWT at
  * ~/.openclaw-autoclaw/request-headers.json (or $OPENCLAW_STATE_DIR/request-headers.json
@@ -16,7 +15,7 @@
  *
  * Usage:
  *   node openai.js
- *   PORT=3001 PREFER_LOCAL=1 node openai.js
+ *   PORT=3001 node openai.js
  *
  * OpenCode / any OpenAI-compatible client:
  *   baseURL : http://localhost:18791/v1
@@ -31,9 +30,9 @@ import {
   readBody, validateChatPayload, generateId,
   SSE_HEADERS, validateModelField, lastMessagePreview,
   logUpstreamErrorBody, callUpstreamWithInvalidRequestRetry,
-  callUpstreamOpenAI, streamLocalGatewayAgent, getLocalGatewayToken,
-  classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
-  shouldFallbackToLocal, createPermanentFailureCache, getClientHeaders, startIdentityWatch, installShutdownHooks, VERSION,
+  callUpstreamOpenAI,
+  classifyUpstreamError, classifyTransportError,
+  createPermanentFailureCache, getClientHeaders, startIdentityWatch, installShutdownHooks, VERSION,
   getPacingGovernor, classifyGovernorError,
   startConfigHeartbeat, startShapeWatch,
 } from "./lib/core.js";
@@ -252,93 +251,6 @@ async function handleChatCompletions(req, res) {
   // terminal ring entry carries the full story.
   let cloudEvidence = null;
 
-  // Local AutoClaw WebSocket agent fallback. Returns true when the response
-  // was fully handled here (success OR terminal error), false when the local
-  // gateway is simply unavailable.
-  const tryLocalAgent = () => {
-    if (!getLocalGatewayToken()) return Promise.resolve(false);
-    // Local-agent requests never touch the cloud transport, so they are not
-    // metered against the account budget — but they are counted separately, so
-    // `--doctor` can show how much of the session the fallback served.
-    governor.noteLocal();
-    log.info(`Executing chat model=${modelId} via local AutoClaw WebSocket agent...`);
-    return new Promise((resolve) => {
-      let fullContent = "";
-      let streamedHeader = false;
-      const startedAt = Date.now();
-
-      streamLocalGatewayAgent({
-        config,
-        modelId,
-        timeoutMs: config.LOCAL_AGENT_TIMEOUT_MS,
-        messages: body.messages,
-        onChunk: ({ delta }) => {
-          if (stream) {
-            if (!streamedHeader) {
-              streamedHeader = true;
-              res.writeHead(200, SSE_HEADERS);
-            }
-            const chunk = JSON.stringify({
-              id: `chatcmpl-${generateId()}`,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: modelId,
-              choices: [{ index: 0, delta: { role: "assistant", content: delta }, finish_reason: null }],
-            });
-            res.write(`data: ${chunk}\n\n`);
-          } else {
-            fullContent += delta;
-          }
-        },
-        onEnd: ({ finishReason }) => {
-          if (stream) {
-            const finalChunk = JSON.stringify({
-              id: `chatcmpl-${generateId()}`,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: modelId,
-              choices: [{ index: 0, delta: {}, finish_reason: finishReason || "stop" }],
-            });
-            res.end(`data: ${finalChunk}\n\ndata: [DONE]\n\n`);
-          } else {
-            sendJSON(res, {
-              id: `chatcmpl-${generateId()}`,
-              object: "chat.completion",
-              created: Math.floor(Date.now() / 1000),
-              model: modelId,
-              choices: [{ index: 0, message: { role: "assistant", content: fullContent }, finish_reason: finishReason || "stop" }],
-              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-            });
-          }
-          log.info(`chat model=${modelId} served via local agent (${Date.now() - startedAt}ms)`);
-          record(200, {
-            model: modelId, lastMessage: fullContent, messageCount: body.messages?.length || 0, via: "local",
-            ...(cloudEvidence ? { cloud_status: cloudEvidence.status, cloud_error: cloudEvidence.code } : {}),
-          });
-          resolve(true);
-        },
-        onError: (err) => {
-          log.warn(`Local gateway execution failed: ${err.message}`);
-          const cls = classifyLocalAgentError(err, modelId);
-          permanentFailures.mark(modelId, cls);
-          if (res.headersSent) {
-            // SSE already went out with 200 — a JSON 502 cannot follow.
-            // Terminate the stream instead of throwing ERR_HTTP_HEADERS_SENT.
-            try { res.end(); } catch (_) {}
-            record(cls.status, { model: modelId, error: `${cls.code} (mid-stream)`, via: "local", ...(cloudEvidence ? { cloud_status: cloudEvidence.status, cloud_error: cloudEvidence.code } : {}) });
-          } else {
-            record(cls.status, {
-              model: modelId, error: cls.code, via: "local",
-              ...(cloudEvidence ? { cloud_status: cloudEvidence.status, cloud_error: cloudEvidence.code } : {}),
-            });
-            sendClassifiedErrorOpenAI(res, cls);
-          }
-          resolve(true);
-        },
-      });
-    });
-  };
-
   // Terminal success handling shared by first-attempt and retried responses.
   async function respondSuccess(successRes) {
     record(successRes.statusCode, { model: modelId, lastMessage: lastMsgForLog(), messageCount: body.messages?.length || 0 });
@@ -374,12 +286,6 @@ async function handleChatCompletions(req, res) {
   }
 
   try {
-    // PREFER_LOCAL=1: skip the cloud attempt entirely when the desktop
-    // gateway is up — saves doomed round-trips while credits are exhausted.
-    if (config.PREFER_LOCAL && getLocalGatewayToken()) {
-      if (await tryLocalAgent()) return;
-    }
-
     // Known-permanent failure within the TTL → answer instantly, identically.
     const cachedFailure = permanentFailures.get(modelId);
     if (cachedFailure) {
@@ -435,25 +341,16 @@ async function handleChatCompletions(req, res) {
     const cls = classifyUpstreamError(effectiveStatus, upstreamErrBody, modelId);
     if (cls.permanent) permanentFailures.mark(modelId, cls);
     log.error(`Upstream error ${effectiveStatus}:`, cls.message);
-    cloudEvidence = { status: effectiveStatus, code: cls.code };
 
-    if (shouldFallbackToLocal(cls.status)) {
-      // The desktop gateway shares this AutoClaw account — a quota/plan wall
-      // stops it too, so don't march a known-permanent failure into it.
-      if (!cls.permanent || !permanentFailures.get(modelId)) {
-        if (await tryLocalAgent()) return;
-      } else {
-        log.info(`Skipping local fallback for ${modelId}: ${cls.code} is permanent`);
-      }
-    }
-
-    // Never fall through to the success path with a >=400 status: a verdict that
-    // is terminal for the fallback is still a failure the client has to see.
+    // The verdict is the client's answer, verbatim. There is no second chance
+    // to take: the desktop agent that used to be tried here ran on the same
+    // account against the same endpoint, so it could only fail the same way —
+    // one whole timeout later — and it did it by *executing the caller's prompt
+    // as a privileged agentic run inside AutoClaw*, editing files in the
+    // operator's workspace. Removed 2026-09-22.
     record(cls.status, {
       model: modelId, lastMessage: lastMsgForLog(), messageCount: body.messages?.length || 0,
       error: cls.code,
-      // cloud evidence rides along on the terminal entry — the test CLI
-      // renders [cloud NNN → local agent] from these fields
       ...(effectiveStatus !== cls.status ? { cloud_status: effectiveStatus, cloud_error: cls.code } : {}),
     });
     return sendClassifiedErrorOpenAI(res, cls);
@@ -462,9 +359,6 @@ async function handleChatCompletions(req, res) {
     // reset, upstream timeout…
     const cls = classifyTransportError(err);
     log.error(`chat model=${modelId} transport failure:`, cls.message);
-    if (!res.headersSent && shouldFallbackToLocal(cls.status)) {
-      if (await tryLocalAgent()) return;
-    }
     if (res.headersSent) { try { res.end(); } catch (_) {} return; }
     record(cls.status, { model: modelId, lastMessage: lastMsgForLog(), messageCount: body.messages?.length || 0, error: cls.code });
     return sendClassifiedErrorOpenAI(res, cls);

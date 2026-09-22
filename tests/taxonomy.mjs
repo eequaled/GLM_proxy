@@ -7,10 +7,12 @@ import path from "node:path";
 import {
   loadConfig,
   classifyUpstreamError,
-  classifyLocalAgentError,
   classifyTransportError,
   isTransientNetworkError,
-  shouldFallbackToLocal,
+  isRetryableThrottle,
+  RETRYABLE_VERDICTS,
+  DEFAULT_THROTTLE_RETRIES,
+  DEFAULT_THROTTLE_RETRY_MS,
   createPermanentFailureCache,
   annotateCreditTiers,
   resolveTierTargets,
@@ -90,30 +92,43 @@ check("upstream 500 → 502 with origin noted", () => {
   assert.match(c.message, /HTTP 500/);
 });
 
-// ── Local-agent classifier ──────────────────────────────────────────────────
+// ── Capacity-retry policy (replaced the local-agent fallback) ───────────────
+//
+// The fallback used to re-run the prompt through AutoClaw's own desktop agent
+// on any 4xx/5xx that was not 404/429. It was removed: the agent ran a full
+// privileged session inside the app, on the operator's machine, for a request
+// the cloud had just refused — and it re-issued the same doomed cloud call
+// anyway. What replaces it is a bounded in-place retry for capacity-shaped
+// verdicts only, so a "try again shortly" throttle waits seconds and succeeds
+// instead of surfacing as a hard error to the harness.
 
-check("agent FailoverError 403 quota body → 402", () => {
-  const c = classifyLocalAgentError(new Error('Gateway agent start failed: {"code":"UNAVAILABLE","message":"FailoverError: HTTP 403: <autoclaw-403-response>{\\"code\\":810000}"}'), "glm");
-  assert.equal(c.status, 402);
-  assert.equal(c.permanent, true);
+check("retry: the policy waits seconds, twice, not minutes", () => {
+  assert.equal(DEFAULT_THROTTLE_RETRIES, 2);
+  assert.equal(DEFAULT_THROTTLE_RETRY_MS, 4_000);
 });
 
-check("agent FailoverError 402 → 402", () => {
-  const c = classifyLocalAgentError(new Error('Gateway agent start failed: FailoverError: 402 status code (no body)'), "deepseek");
-  assert.equal(c.status, 402);
-  assert.equal(c.permanent, true);
+check("retry: only capacity-shaped verdicts qualify", () => {
+  for (const code of ["upstream_busy", "rate_limited_by_upstream", "upstream_failure"]) {
+    assert.equal(isRetryableThrottle({ code, permanent: false }), true, code);
+  }
 });
 
-check("agent timeout → 504", () => {
-  const c = classifyLocalAgentError(new Error("Local gateway execution timeout (120s)"), "m");
-  assert.equal(c.status, 504);
-  assert.equal(c.code, "local_gateway_timeout");
+check("retry: a ban and a quota wall are never retried", () => {
+  // Retrying these spends time, changes nothing, and a retried ban is exactly
+  // the account-damaging behaviour the governor exists to prevent.
+  assert.equal(isRetryableThrottle({ code: "account_banned", permanent: true }), false);
+  assert.equal(isRetryableThrottle({ code: "quota_exhausted", permanent: true }), false);
+  assert.equal(isRetryableThrottle({ code: "model_not_found", permanent: true }), false);
+  assert.equal(isRetryableThrottle({ code: "invalid_request", permanent: false }), false);
+  assert.equal(isRetryableThrottle(null), false);
 });
 
-check("missing gateway token → 503", () => {
-  const c = classifyLocalAgentError(new Error("Local AutoClaw gateway token not found. Is AutoClaw running?"), "m");
-  assert.equal(c.status, 503);
-  assert.equal(c.code, "no_local_gateway");
+check("retry: a permanent verdict is refused even if its code is capacity-shaped", () => {
+  assert.equal(isRetryableThrottle({ code: "upstream_busy", permanent: true }), false);
+});
+
+check("retry: the retryable set is exactly the three capacity verdicts", () => {
+  assert.deepEqual([...RETRYABLE_VERDICTS].sort(), ["rate_limited_by_upstream", "upstream_busy", "upstream_failure"]);
 });
 
 // ── Transport classifier ────────────────────────────────────────────────────
@@ -138,17 +153,6 @@ check("connection reset → 502 connection_failed", () => {
 check("ECONNRESET counts as transient", () => {
   assert.equal(isTransientNetworkError({ code: "ECONNRESET", message: "" }), true);
   assert.equal(isTransientNetworkError({ code: "UPSTREAM_TIMEOUT", message: "Upstream timeout" }), false);
-});
-
-// ── Fallback decision ───────────────────────────────────────────────────────
-
-check("shouldFallbackToLocal truth table", () => {
-  assert.equal(shouldFallbackToLocal(200), false);
-  assert.equal(shouldFallbackToLocal(400), true);
-  assert.equal(shouldFallbackToLocal(402), true);   // parity fix vs old anthropic.js
-  assert.equal(shouldFallbackToLocal(404), false);
-  assert.equal(shouldFallbackToLocal(429), false);
-  assert.equal(shouldFallbackToLocal(500), true);
 });
 
 // ── Permanent-failure cache ─────────────────────────────────────────────────
@@ -348,15 +352,16 @@ check("403 + 410004 banned body → permanent 403 account_banned", () => {
 
 // The free-tier capacity throttle (403 + 810002, "kind":"pay-view") is neither a
 // ban nor quota exhaustion — the account works again shortly. It must classify as
-// a 429 so clients back off, and so the local-agent fallback is refused: measured
-// on a live 2026-09-21 session, every 810002 otherwise spent the full 120 s local
-// budget on a run that re-issues the same cloud call and fails identically.
-check("403 + 810002 pay-view throttle → 429 upstream_busy, never the local agent", () => {
+// a 429 so clients back off, and it must qualify for the bounded capacity retry:
+// measured live 2026-09-22, the old path spent ~120 s per occurrence marching it
+// into the desktop agent, which re-issued the same cloud call and failed the same
+// way. Now it waits seconds and tries the cloud again, in place.
+check("403 + 810002 pay-view throttle → 429 upstream_busy, and it is retryable", () => {
   const c = classifyUpstreamError(403, '{"action":{"kind":"pay-view"},"code":810002,"image_url":"https://example.invalid/f.png","message":"We\'re experiencing high demand right now. Please try again shortly, or upgrade to a monthly subscription for priority access."}', "tdpsk_deepseek-v4-flash-202605");
   assert.equal(c.status, 429);
   assert.equal(c.code, "upstream_busy");
   assert.equal(c.permanent, false);
-  assert.equal(shouldFallbackToLocal(c.status), false);
+  assert.equal(isRetryableThrottle(c), true);
 });
 
 check("账号已被封禁 translates to English", () => {

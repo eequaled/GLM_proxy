@@ -25,9 +25,9 @@ import {
   readBody, validateChatPayload, generateId,
   SSE_HEADERS, validateModelField, lastMessagePreview,
   logUpstreamErrorBody, callUpstreamWithInvalidRequestRetry,
-  callUpstreamAnthropic, streamLocalGatewayAgent, getLocalGatewayToken,
-  classifyUpstreamError, classifyLocalAgentError, classifyTransportError,
-  shouldFallbackToLocal, createPermanentFailureCache,
+  callUpstreamAnthropic,
+  classifyUpstreamError, classifyTransportError,
+  createPermanentFailureCache,
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
   getClientHeaders, startIdentityWatch, installShutdownHooks, VERSION,
   getPacingGovernor, classifyGovernorError,
@@ -545,109 +545,7 @@ async function handleMessages(req, res) {
 
   const lastMsgForLog = () => lastMessagePreview(openAIBody.messages);
 
-  // Local AutoClaw WebSocket agent fallback (same trigger rules as the OpenAI
-  // entrypoint — this is what gives Anthropic its 402/403/5xx parity).
-  // Set when the cloud upstream rejects the request before fallback runs;
-  // consumed by record() so the terminal entry carries the cloud verdict.
-  let cloudEvidence = null;
-  const tryLocalAgent = () => {
-    // Local-agent requests never touch the cloud transport: not metered against
-    // the account budget, but counted so `--doctor` can attribute the session.
-    governor.noteLocal();
-    if (!getLocalGatewayToken()) return Promise.resolve(false);
-    log.info(`Executing chat model=${modelId} via local AutoClaw WebSocket agent...`);
-    return new Promise((resolve) => {
-      let fullContent = "";
-      let streamedStart = false;
-      const startedAt = Date.now();
-
-      streamLocalGatewayAgent({
-        config,
-        modelId,
-        timeoutMs: config.LOCAL_AGENT_TIMEOUT_MS,
-        messages: openAIBody.messages,
-        onChunk: ({ delta }) => {
-          if (stream) {
-            if (!streamedStart) {
-              streamedStart = true;
-              res.writeHead(200, SSE_HEADERS);
-              res.write(fmt("message_start", {
-                type: "message_start",
-                message: {
-                  id: `msg_${generateId()}`, type: "message", role: "assistant",
-                  model: body.model, content: [], stop_reason: null, stop_sequence: null,
-                  usage: { input_tokens: 0, output_tokens: 0 },
-                },
-              }));
-              res.write(fmt("content_block_start", {
-                type: "content_block_start", index: 0,
-                content_block: { type: "text", text: "" },
-              }));
-            }
-            res.write(fmt("content_block_delta", {
-              type: "content_block_delta", index: 0,
-              delta: { type: "text_delta", text: delta },
-            }));
-          } else {
-            fullContent += delta;
-          }
-        },
-        onEnd: ({ finishReason }) => {
-          if (stream) {
-            res.write(fmt("content_block_stop", { type: "content_block_stop", index: 0 }));
-            res.write(fmt("message_delta", {
-              type: "message_delta",
-              delta: { stop_reason: anthropicStopReason(finishReason), stop_sequence: null },
-              usage: { output_tokens: 0 },
-            }));
-            res.write(fmt("message_stop", { type: "message_stop" }));
-            res.end();
-          } else {
-            sendJSON(res, {
-              id: `msg_${generateId()}`,
-              type: "message",
-              role: "assistant",
-              model: body.model,
-              content: [{ type: "text", text: fullContent }],
-              stop_reason: anthropicStopReason(finishReason),
-              stop_sequence: null,
-              usage: { input_tokens: 0, output_tokens: 0 },
-            });
-          }
-          log.info(`chat model=${modelId} served via local agent (${Date.now() - startedAt}ms)`);
-          record(200, {
-            lastMessage: fullContent,
-            messageCount: openAIBody.messages?.length || 0,
-            via: "local",
-            ...(cloudEvidence ? { cloud_status: cloudEvidence.status, cloud_error: cloudEvidence.code } : {}),
-          });
-          resolve(true);
-        },
-        onError: (err) => {
-          log.warn(`Local gateway execution failed: ${err.message}`);
-          const cls = classifyLocalAgentError(err, modelId);
-          permanentFailures.mark(modelId, cls);
-          if (res.headersSent) {
-            // Stream already started — close it rather than throwing a
-            // second writeHead onto a spent response.
-            try { res.end(); } catch (_) {}
-            record(cls.status, { error: `${cls.code} (mid-stream)`, via: "local", ...(cloudEvidence ? { cloud_status: cloudEvidence.status, cloud_error: cloudEvidence.code } : {}) });
-          } else {
-            record(cls.status, { error: cls.code, via: "local", ...(cloudEvidence ? { cloud_status: cloudEvidence.status, cloud_error: cloudEvidence.code } : {}) });
-            sendClassifiedErrorAnthropic(res, cls);
-          }
-          resolve(true);
-        },
-      });
-    });
-  };
-
   try {
-    // PREFER_LOCAL=1 fast path — skip doomed cloud attempts entirely.
-    if (config.PREFER_LOCAL && getLocalGatewayToken()) {
-      if (await tryLocalAgent()) return;
-    }
-
     const cachedFailure = permanentFailures.get(modelId);
     if (cachedFailure) {
       log.info(`chat model=${modelId} short-circuited: ${cachedFailure.code} (recently confirmed)`);
@@ -688,26 +586,14 @@ async function handleMessages(req, res) {
 
     // Failure path only — a 2xx falls through to the success renderer below.
     if (statusCode >= 400) {
-      // Classify BEFORE deciding, and decide the fallback on the CLASSIFIED
-      // status rather than the raw one — see the long note in openai.js. In
-      // short: a raw 403 meaning "free-tier capacity throttle" (810002)
-      // classifies to 429, and 429 is terminal for the fallback, so gating on
-      // the raw status marched the throttle into the desktop agent and reported
-      // it to the client as a local-gateway failure.
+      // Classify the verdict the client will see. The classified status is
+      // what goes on the wire: a raw 403 meaning "free-tier capacity throttle"
+      // (810002) becomes 429 upstream_busy, so a harness backs off instead of
+      // retrying into a wall.
       const cls = classifyUpstreamError(statusCode, upstreamErrBody, modelId);
       if (cls.permanent) permanentFailures.mark(modelId, cls);
       log.error(`Upstream error ${statusCode}:`, cls.message);
       cloudEvidence = { status: statusCode, code: cls.code };
-
-      if (shouldFallbackToLocal(cls.status)) {
-        // The desktop gateway shares this AutoClaw account — quota walls stop
-        // it too, so don't march known-permanent failures into it.
-        if (!cls.permanent || !permanentFailures.get(modelId)) {
-          if (await tryLocalAgent()) return;
-        } else {
-          log.info(`Skipping local fallback for ${modelId}: ${cls.code} is permanent`);
-        }
-      }
 
       record(cls.status, {
         lastMessage: lastMsgForLog(),
@@ -778,9 +664,6 @@ async function handleMessages(req, res) {
   } catch (err) {
     const cls = classifyTransportError(err);
     log.error(`messages model=${body.model} transport failure:`, cls.message);
-    if (!res.headersSent && shouldFallbackToLocal(cls.status)) {
-      if (await tryLocalAgent()) return;
-    }
     if (res.headersSent) { try { res.end(); } catch (_) {} return; }
     record(cls.status, { lastMessage: lastMsgForLog(), messageCount: openAIBody.messages?.length || 0, error: cls.code });
     return sendClassifiedErrorAnthropic(res, cls);

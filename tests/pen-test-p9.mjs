@@ -20,6 +20,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { PEN_TEST_PORTS } from "../lib/constants.js";
+import { DEFAULT_THROTTLE_RETRIES } from "../lib/core.js";
 import { check, post, proxyOutput, startProxy, startTlsMock, stopProxy, summary } from "./_helpers.mjs";
 
 const PORT = PEN_TEST_PORTS.p9;
@@ -56,12 +57,13 @@ function makeHome({ gateway = false } = {}) {
   return dir;
 }
 
-async function againstMock(scenario, home) {
+async function againstMock(scenario, home, extraEnv = {}) {
   const { mock, port } = await startTlsMock(scenario);
   const proxy = await startProxy(PORT, {
     HOME: home, USERPROFILE: home,
     UPSTREAM_HOST: "127.0.0.1", UPSTREAM_PORT: String(port),
     LOG_LEVEL: "info",
+    ...extraEnv,
   });
   return { mock, proxy };
 }
@@ -91,9 +93,14 @@ const ask = () => post(PORT, {
   check("throttle: no 120 s local timeout is waited out",
     !/Local gateway execution timeout/.test(out));
 
+  // A capacity throttle is retried in-process before the client ever hears
+  // about it, because the upstream's own body says "try again shortly" — that is
+  // what stops a 30-second-patience harness from dying on a transient wall. So
+  // the count is 1 + DEFAULT_THROTTLE_RETRIES: bounded and pinned, never a storm,
+  // and the client still ends up with the classified 429 once they are spent.
   const upstreamHits = mock.getRequests().length;
-  check("throttle: the request reached the upstream exactly once (no retry storm)",
-    upstreamHits === 1, String(upstreamHits));
+  check("throttle: the throttle is retried, but the retries are bounded",
+    upstreamHits === DEFAULT_THROTTLE_RETRIES + 1, String(upstreamHits));
 
   await stopProxy(proxy);
   await mock.close();
@@ -119,6 +126,11 @@ const ask = () => post(PORT, {
   check("ban: the local agent is never invoked — the same account feeds it",
     !/via local AutoClaw WebSocket agent/.test(out));
 
+  // The negative half of the retry policy, and the more important half: a ban is
+  // deterministic, so another attempt only spends time and digs the hole deeper.
+  check("ban: a ban is never retried (one attempt, then the verdict)",
+    mock.getRequests().length === 1, String(mock.getRequests().length));
+
   await stopProxy(proxy);
   await mock.close();
   fs.rmSync(home, { recursive: true, force: true });
@@ -137,9 +149,13 @@ const ask = () => post(PORT, {
   const elapsed = Date.now() - startedAt;
 
   check("repeat: a second throttled request answers 429 as well", second.status === 429, second.status);
-  check("repeat: it does not sit through a 403 attempt plus a local-agent wait",
-    elapsed < 10_000, `${elapsed}ms`);
-  check("repeat: the upstream is not hammered on the retry", mock.getRequests().length - before <= 1,
+  // Bounded by the retry budget (≈8–12 s for two waits), not by the 120 s
+  // desktop-agent budget this path used to sit through, and comfortably inside a
+  // harness's own ~30 s patience.
+  check("repeat: it answers inside the retry budget, not a 120 s agent wait",
+    elapsed < 30_000, `${elapsed}ms`);
+  check("repeat: the retries stay bounded on the second request too",
+    mock.getRequests().length - before <= DEFAULT_THROTTLE_RETRIES + 1,
     String(mock.getRequests().length - before));
 
   await stopProxy(proxy);
@@ -174,8 +190,86 @@ const ask = () => post(PORT, {
     !/via local AutoClaw WebSocket agent/.test(out),
     out.split("\n").filter((l) => /local AutoClaw WebSocket agent/.test(l)).join(" | "));
 
-  check("throttle+gateway: the upstream is still hit exactly once",
-    mock.getRequests().length === 1, String(mock.getRequests().length));
+  check("throttle+gateway: the upstream is hit once per bounded attempt, no storm",
+    mock.getRequests().length === DEFAULT_THROTTLE_RETRIES + 1, String(mock.getRequests().length));
+
+  await stopProxy(proxy);
+  await mock.close();
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+// ---- 5. the local desktop-agent fallback is gone, and that is deliberate ----
+//
+// A cloud failure used to fall back to AutoClaw's own desktop agent over a local
+// WebSocket, opening it as role "operator" with operator.write / operator.admin
+// scopes and `tool_events`. That is a *second agent with write access to this
+// machine*, running whatever prompt the harness sent — a throttled or failing
+// cloud call could kick off a full agentic run inside AutoClaw, and in a coding
+// session that is indistinguishable from a rogue writer editing your files.
+//
+// It rarely worked, and when it did the work happened inside AutoClaw instead of
+// here. It is deleted; these cases fail if anyone brings it back.
+//
+// The fallback is gone, so the LOCAL_GATEWAY_PORT env and the .gateway-token
+// below are inert today. They stay as a tripwire: if the deleted bridge is ever
+// reintroduced it finds a dead port and a fake token, so a test run can never
+// wake a real AutoClaw agent on the developer's machine.
+{
+  const home = makeHome({ gateway: true });
+  const { mock, proxy } = await againstMock(
+    { status: 500, body: { error: "mock upstream exploded" } },
+    home,
+    { LOCAL_GATEWAY_PORT: "1" },
+  );
+
+  const startedAt = Date.now();
+  const res = await ask();
+  const elapsed = Date.now() - startedAt;
+  const out = proxyOutput(proxy).all || "";
+
+  check("no-fallback: a cloud 500 surfaces as the cloud verdict",
+    res.status === 502 && /upstream_failure/.test(res.body),
+    `${res.status} ${String(res.body).slice(0, 90)}`);
+
+  check("no-fallback: the desktop agent is never invoked",
+    !/via local AutoClaw WebSocket agent/.test(out),
+    out.split("\n").filter((l) => /WebSocket agent/.test(l)).join(" | "));
+
+  check("no-fallback: nothing even mentions the local gateway",
+    !/local AutoClaw gateway|LOCAL_GATEWAY|gateway-token/i.test(out),
+    out.split("\n").filter((l) => /local gateway/i.test(l)).join(" | "));
+
+  // A 5xx is capacity-shaped, so it is retried too — but the whole exchange
+  // must stay inside the retry budget. The number that matters is what it is NOT:
+  // the 120 s a doomed desktop-agent run used to burn here.
+  check("no-fallback: it answers inside the retry budget, not an agent budget",
+    elapsed < 30_000, `${elapsed}ms`);
+
+  check("no-fallback: bounded attempts, exactly one client-visible answer",
+    mock.getRequests().length === DEFAULT_THROTTLE_RETRIES + 1, String(mock.getRequests().length));
+
+  await stopProxy(proxy);
+  await mock.close();
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+// PREFER_LOCAL used to skip the cloud entirely and drive the desktop agent
+// instead. It is gone too — and an env var that silently changes nothing is
+// worse than one that says it was removed.
+{
+  const home = makeHome({ gateway: true });
+  const { mock, proxy } = await againstMock({}, home, { PREFER_LOCAL: "1" });
+
+  const res = await ask();
+  const out = proxyOutput(proxy).all || "";
+
+  check("no-fallback: PREFER_LOCAL=1 still serves from the cloud",
+    res.status === 200 && mock.getRequests().length === 1,
+    `${res.status} hits=${mock.getRequests().length}`);
+
+  check("no-fallback: and the removal is stated, not silently ignored",
+    /PREFER_LOCAL/.test(out) && /removed|no longer|ignored|not supported/i.test(out),
+    out.split("\n").filter((l) => /PREFER_LOCAL/.test(l)).join(" | "));
 
   await stopProxy(proxy);
   await mock.close();

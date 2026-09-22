@@ -9,7 +9,7 @@ import { spawnSync } from "child_process";
 import {
   getModelCatalog, loadConfig, createTokenLayer,
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
-  getLocalGatewayToken, getIdentityLayer, getPacingGovernor, getConfigHeartbeat, COLORS,
+  getIdentityLayer, getPacingGovernor, getConfigHeartbeat, COLORS,
 } from "../lib/core.js";
 import { DEFAULT_PORTS, DEFAULT_HOST, DEFAULT_PROXY_KEY, TEST_PROXY_PORT } from "../lib/constants.js";
 import { describeTokenWindow } from "../lib/governor.js";
@@ -77,7 +77,8 @@ function showHelp() {
     GLMP_MIN_GAP_MS   Minimum gap between upstream calls, jittered (default: 250; 0 = off)
     GOVERNOR_PERSIST=0
                       Do not carry the budget window across restarts
-    PREFER_LOCAL=1    Skip cloud attempts when the local AutoClaw gateway is up
+    PREFER_LOCAL      Removed. The local desktop-agent fallback is gone, so the
+                      cloud is the only route (setting PREFER_LOCAL=1 logs a notice)
     TRUSTED_PROXIES   Comma-separated IPs whose X-Forwarded-For header is trusted
   `);
   process.exit(0);
@@ -118,7 +119,7 @@ async function runModelTests() {
   console.log(`  ───────────────────────────────────────────`);
 
   // Spin up a temporary proxy on a test port so requests go through
-  // the full pipeline (cloud upstream → local gateway fallback).
+  // the full pipeline (validate → shape → governor → cloud).
   const testPort = TEST_PROXY_PORT;
   const testKey = "model-test-" + Date.now();
 
@@ -171,11 +172,7 @@ async function runModelTests() {
     return;
   }
 
-  const localToken = getLocalGatewayToken();
-  console.log(`  Local gateway: ${localToken ? `${COLORS.BLUE}available${COLORS.RESET}` : `${COLORS.GRAY}not found${COLORS.RESET}`}`);
-
-  // Fallback-served requests are invisible in terminal output otherwise —
-  // point the operator at the isolated log for per-request attribution.
+  // Per-request attribution lives in the isolated log the test proxy writes.
   console.log(`  Request log  : ${path.basename(testEnvLog)}\n`);
 
   // Cloud-evidence baseline: only entries written from this run onward count.
@@ -226,11 +223,10 @@ async function runModelTests() {
         try {
           const parsed = JSON.parse(result.body);
           answer = parsed.choices?.[0]?.message?.content || "";
-          // Attribution: responses assembled by the local-agent fallback carry
-          // zero usage counters — cloud answers report real token usage.
-          servedBy = parsed.usage?.prompt_tokens === 0 && parsed.usage?.completion_tokens === 0
-            ? ` ${COLORS.MAGENTA}[${cloudStatus ?? "cloud n/a"} → local agent]${COLORS.RESET}`
-            : cloudStatus ? ` ${COLORS.GRAY}[${cloudStatus}]${COLORS.RESET}` : "";
+          // Every answer here comes from the cloud now — there is no second
+          // route. Tag the upstream status when it is not a plain 200, i.e.
+          // when the in-process retry absorbed an attempt before answering.
+          servedBy = cloudStatus ? ` ${COLORS.GRAY}[${cloudStatus}]${COLORS.RESET}` : "";
         } catch {}
         const preview = answer.length > 40 ? answer.slice(0, 40) + "…" : answer;
         console.log(`${COLORS.BLUE}✔ working${COLORS.RESET}${servedBy} ${COLORS.GRAY}(${elapsed}ms) → ${preview}${COLORS.RESET}`);
@@ -245,7 +241,7 @@ async function runModelTests() {
     }
   }
 
-  console.log(`\n  ${COLORS.GRAY}Legend: [cloud NNN → local agent] = cloud rejected the request (HTTP NNN), the desktop-app fallback served it instead.${COLORS.RESET}`);
+  console.log(`\n  ${COLORS.GRAY}Legend: [cloud NNN] = a first attempt returned HTTP NNN (capacity throttle or 5xx) and the proxy retried in-process before answering; [cloud ok] = first attempt succeeded.${COLORS.RESET}`);
   console.log("");
   proxyProc.kill();
   await new Promise((r) => setTimeout(r, 300));

@@ -136,13 +136,13 @@ It also paces itself: a sliding hourly request budget per account keeps a runawa
 Your App           GLM Proxy                          AutoClaw Backend
 (OpenAI SDK)  ───▶ 127.0.0.1:18791 (OpenAI format)  ───▶  autoglm-api.autoglm.ai (cloud)
                    127.0.0.1:18792 (Anthropic format)
-                         │  cloud fails
-                         ▼
-                    AutoClaw desktop agent
-                    127.0.0.1:18789 (local WebSocket)
+                         │  cloud is the only
+                         ▼  route (throttles
+              AutoClaw cloud   are retried here)
+              autoglm-api.autoglm.ai
 ```
 
-AutoClaw handles authentication automatically. When the cloud path fails, requests fall back to AutoClaw's own desktop agent over a local WebSocket. See [Local gateway fallback](#local-gateway-fallback) for details.
+AutoClaw handles authentication automatically. The cloud is the only route: if it answers a capacity throttle, the proxy waits and retries in-process so a transient wall does not kill your harness session. See [Throttle retries](#throttle-retries-and-why-there-is-no-fallback) for details.
 
 <p align="center">
   <i>AutoClaw running as your background service, that's the whole "auth" story</i>
@@ -230,11 +230,11 @@ glmproxy --test-models
 
 ```
   ✔ working [cloud ok] (1.2s) → PONG
-  ✔ working [cloud 402 → local agent] (38.4s) → PONG 🦞
+  ✔ working [cloud 403] (11.3s) → PONG 🦞
   ✗ failed (404) (0.9s) → Model ... is not recognized by AutoClaw upstream
 ```
 
-`[cloud ok]` means the cloud served it. `[cloud NNN → local agent]` means the cloud rejected it (HTTP NNN) and AutoClaw's desktop-agent fallback answered. This uses isolated log files, so it never clobbers your running proxy's records.
+`[cloud ok]` means the first attempt succeeded. `[cloud NNN]` means a first attempt returned HTTP NNN — a capacity throttle or a 5xx — and the proxy retried in-process before answering. That 11.3s is the retry budget, not a fallback. This uses isolated log files, so it never clobbers your running proxy's records.
 
 </details>
 
@@ -252,7 +252,7 @@ glmproxy --test-models
 | `GOVERNOR_PERSIST` | on | Set to `0` to stop carrying the pacing window across restarts. On by default: a crash should not hand the account a fresh hourly budget |
 | `MAX_MESSAGES` / `--max-messages` | unlimited (`0`/unset) | Max message/entity limit in request payload (explicit values: 128, 256, 512, 1024). Leave unlimited if your harness compresses or batches history, raise it if you hit `413 / payload too large` |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `silent` |
-| `PREFER_LOCAL` | off | Set to `1` to use the local AutoClaw gateway first, skipping cloud attempts |
+| `PREFER_LOCAL` | removed | The local desktop-agent fallback is gone (see [Throttle retries](#throttle-retries-and-why-there-is-no-fallback)). Setting `PREFER_LOCAL=1` is a stated no-op that logs a notice; the cloud is the only route |
 | `TRUSTED_PROXIES` | empty | Comma-separated IPs whose `X-Forwarded-For` header is trusted for rate limiting |
 | `MAX_BODY_BYTES` | `52428800` | Max request body (50 MB) |
 | `MAX_MESSAGE_TEXT_BYTES` | `262144` | Max per-message TEXT size (256 KB; base64 image data is not counted as text) |
@@ -263,9 +263,8 @@ glmproxy --test-models
 | `JSONL_SYNC` | off | Write JSONL lines synchronously when `true` (flush every line) |
 | `JSONL_MAX_BYTES` | `10485760` | Rotate JSONL log when it exceeds this (10 MB) |
 | `UPSTREAM_TIMEOUT_MS` | `120000` | Per-attempt upstream budget (idle-based, the vendor allows up to 20 min, raise this for slow thinking models) |
-| `LOCAL_AGENT_TIMEOUT_MS` | `120000` | Budget for the local AutoClaw desktop-agent fallback. That path drives a real agent session (seconds to minutes by design), but if your client gives up sooner than this you get a client-side timeout instead of the classified error — lower it so failures surface while your harness is still listening |
-| `GATEWAY_MIN_PROTOCOL` / `GATEWAY_MAX_PROTOCOL` | `3` / `4` | Local-gateway WS protocol range offered on connect (self-heals to the gateway's expected protocol on mismatch) |
-| `LOCAL_GATEWAY_HOST` / `LOCAL_GATEWAY_PORT` | `127.0.0.1` / `18789` | Where the AutoClaw desktop gateway is expected |
+| `GLMP_THROTTLE_RETRY_MS` | `4000` | Base wait before retrying a capacity throttle (the free tier's `810002` "high demand", or a plain upstream 429), jittered ±20% and growing 1.5× per attempt |
+| `GLMP_THROTTLE_RETRIES` | `2` | Retry count for capacity throttles. `0` turns retrying off. Bans and quota walls are never retried — those are deterministic |
 | `FALLBACK_MODELS_PATH` | empty | Path to an external fallback model catalog JSON (`{"models":[...]}`), defaults to the shipped `lib/fallback-models.json` |
 | `AUTOCLAW_SYSTEM_BANNER` | discovered (fallback: the app's own literal) | Override the system-prompt banner injected into cloud requests. The banner is now **discovered from your installed app** (`resources/gateway/openclaw/dist/system-prompt-config-*.js`), cached to `proxy-state/banner.last-good.json`, and only falls back to a compiled-in literal when nothing is discoverable — because the old pin had a one-character bug (a single `\n` where the app emits a blank line before `## Tooling`). Discovery outranks the pin; this env var outranks discovery, so set it only to patch a reworded prompt without a release |
 | `PROMPT_ENVELOPE_KB` | off (`0`) | Cap the **system** message at this many KB before forwarding. A foreign harness sends a 30 KB system prompt the app never would; over the envelope the proxy drops the middle and inserts a visible marker, keeping the head (banner, framing) and the tail (the actual current request). Only the system message is touched — your conversation history is never truncated. Off by default: compaction changes the prompt you asked for, so it is opt-in |
@@ -291,7 +290,7 @@ glmproxy --test-models
 {"ts":"2026-07-29T03:41:00.000Z","model":"zai_auto","status":200,"ip":"127.0.0.1","latencyMs":423}
 ```
 
-Alongside the JSONL stream, a compact ring log (`proxy_requests.json`, last 50 entries; path via `REQUEST_LOG_FILE`) records every terminal outcome, including `via: "local"` and the cloud verdict (`cloud_status` / `cloud_error`) when the cloud rejected a request the local agent ended up serving.
+Alongside the JSONL stream, a compact ring log (`proxy_requests.json`, last 50 entries; path via `REQUEST_LOG_FILE`) records every terminal outcome, including the raw upstream status when the first attempt was not a plain 200 (`cloud_status`) and the classified error code.
 
 </details>
 
@@ -460,9 +459,31 @@ write-up with the evidence.
 </details>
 
 <details>
-<summary><h2>Local gateway fallback</h2></summary>
+<summary><h2>Throttle retries (and why there is no fallback)</h2></summary>
 
-When the cloud upstream fails (and it's not a plain 404/429), the proxy re-runs your prompt through AutoClaw's own desktop agent over a local WebSocket (`127.0.0.1:18789`). Responses served this way are logged with `via: "local"`. It's a full agentic run (slower, tools included) and shares your account's credits, so quota walls stop it too. Set `PREFER_LOCAL=1` to skip the cloud attempt entirely while credits are exhausted.
+
+When the upstream answers a **capacity throttle** — the free tier's `403` + `810002`
+"high demand… upgrade to a monthly subscription for priority access" — the proxy does
+not hand that straight to your harness. It waits a few seconds and tries again: two
+retries, jittered, about 4 s then about 6 s. The upstream's own body says "try again
+shortly", and for a sustained throttle this turns a session-killing error into a brief
+pause. If the wall is still there after both retries you get a clean `429` with a
+`Retry-After`, so your harness can back off on its own terms. `GLMP_THROTTLE_RETRY_MS`
+tunes the base wait, `GLMP_THROTTLE_RETRIES` the count (`0` turns retrying off).
+
+A **ban** (`410004`) or a **quota wall** is never retried. Those are deterministic, so
+another attempt only spends time and digs the hole deeper.
+
+There used to be a second route here. On a cloud failure the proxy re-ran your prompt
+through AutoClaw's own desktop agent over a local WebSocket (`127.0.0.1:18789`) — a full
+agentic run, tools included, opened with `operator.write` scopes inside AutoClaw. It is
+gone, deliberately: it rarely worked, and when it did the work happened inside AutoClaw
+instead of in your harness. Worse, because it ran *your* prompt as a full agent, a
+throttled call could start a second agent with write access to your working directory.
+It also misreported failures — a cloud `500` reached the client as `local_gateway_failed`
+carrying the gateway's connection error, and `PREFER_LOCAL=1` (which skipped the cloud
+entirely and drove that agent) was a hard outage whenever the desktop app was down.
+`PREFER_LOCAL` is now a stated no-op that says so in the log.
 
 </details>
 
@@ -524,7 +545,7 @@ TRUSTED_PROXIES=127.0.0.1 glmproxy --host 0.0.0.0
 - The token file is watched for changes, so AutoClaw can rotate auth mid-session without a restart
 - AutoClaw's client identity (app version, platform, channel) loads dynamically from its runtime file, same as the model catalog, so an AutoClaw app update is picked up without editing or restarting the proxy
 - The fallback model catalog lives in `lib/fallback-models.json` (override with `FALLBACK_MODELS_PATH`). The built-in list is only a last resort when AutoClaw's runtime file is unreadable
-- The local-gateway connection self-heals: if the gateway bumps its WS protocol, the proxy reconnects with the expected version automatically
+- A capacity throttle is retried in-process (two attempts, about 4 s then 6 s) so a transient "high demand" wall does not stop your harness. A ban or a quota wall is never retried
 - No dependencies at all. The interactive menu is hand-rolled on Node's built-in `readline`, so there's zero `node_modules` and zero install step
 
 </details>
