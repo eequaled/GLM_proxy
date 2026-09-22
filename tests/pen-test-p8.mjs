@@ -21,6 +21,8 @@ import {
   createConfigHeartbeat, DEFAULT_INTERVAL_MS, MAX_BACKOFF_MS, JITTER_RATIO,
   fingerprintModels, describeModelChange,
 } from "../lib/heartbeat.js";
+import { createPacingGovernor } from "../lib/governor.js";
+import { closeConfigHeartbeats, closePacingGovernors, getConfigHeartbeat, getPacingGovernor } from "../lib/core.js";
 import { check, post, proxyOutput, startProxy, startTlsMock, stopProxy, summary } from "./_helpers.mjs";
 
 const PORT = PEN_TEST_PORTS.p8;
@@ -209,7 +211,7 @@ fs.rmSync(homeE, { recursive: true, force: true });
 // and failure backoff are *asserted* rather than slept through. This suite must
 // never wait 300 s to find out whether the schedule is right.
 
-function heartbeatHarness({ intervalMs = DEFAULT_INTERVAL_MS, random = () => 0.5, paused = () => false } = {}) {
+function heartbeatHarness({ intervalMs = DEFAULT_INTERVAL_MS, random = () => 0.5, paused = () => false, onHealthy = null } = {}) {
   const clock = { now: 1_700_000_000_000 };
   const output = { info: [], warn: [], debug: [] };
   const logger = {
@@ -240,6 +242,7 @@ function heartbeatHarness({ intervalMs = DEFAULT_INTERVAL_MS, random = () => 0.5
       },
       onCatalog: () => { calls.applies++; },
       isPaused: paused,
+      onHealthy,
     },
   );
 
@@ -342,6 +345,106 @@ function heartbeatHarness({ intervalMs = DEFAULT_INTERVAL_MS, random = () => 0.5
     d >= DEFAULT_INTERVAL_MS * 4 * (1 - JITTER_RATIO) && d <= DEFAULT_INTERVAL_MS * 4 * (1 + JITTER_RATIO),
     String(d));
   h.heartbeat.stop();
+}
+
+// Task 7a: the heartbeat is also the ban-lift detector. A 200 from the config
+// GET costs nothing and proves the account works again, so a healthy poll must
+// be able to lift a quarantine — without it, quarantine is a one-way door and a
+// stale-identity false ban (the class that actually happens) is permanent.
+{
+  let healthy = 0;
+  const h = heartbeatHarness({ onHealthy: () => { healthy++; } });
+  h.heartbeat.start();
+
+  await h.fire();
+  check("heartbeat: a healthy poll reports the account healthy (the ban-lift probe)",
+    healthy === 1, `onHealthy calls=${healthy}`);
+
+  h.setMode("null");
+  await h.fire();
+  check("heartbeat: an empty payload does NOT report healthy",
+    healthy === 1, `onHealthy calls=${healthy}`);
+
+  h.setMode("throw");
+  await h.fire();
+  check("heartbeat: a throwing poll does NOT report healthy",
+    healthy === 1, `onHealthy calls=${healthy}`);
+
+  h.setMode("ok");
+  await h.fire();
+  check("heartbeat: recovery reports healthy again",
+    healthy === 2, `onHealthy calls=${healthy}`);
+  h.heartbeat.stop();
+}
+
+// A throwing onHealthy is containment, not propagation — the lift is a bonus,
+// never a reason for the companion poll to die (Requirement 5.3).
+{
+  const h = heartbeatHarness({ onHealthy: () => { throw new Error("lift boom"); } });
+  h.heartbeat.start();
+  let threw = false;
+  try { await h.fire(); } catch (_) { threw = true; }
+  check("heartbeat: an onHealthy that throws never escapes the heartbeat",
+    !threw && h.heartbeat.status().consecutiveFailures === 0, `threw=${threw}`);
+  h.heartbeat.stop();
+}
+
+// The end-to-end promise: a quarantined account whose config GET now returns 200
+// is released by the heartbeat alone — no completion spent to find out.
+{
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "glmp-p8-gov-"));
+  const governor = createPacingGovernor(
+    { BUDGET_REQUESTS_PER_HOUR: 100, MIN_GAP_MS: 0, STATE_DIR: stateDir },
+    null,
+  );
+  const key = "user:p8-lift";
+  governor.recordUpstreamSignal(key, 403, '{"code":410004,"message":"账号已被封禁"}');
+  check("lift: the account starts quarantined (a 410004 ban signal)",
+    governor.tryAcquire(key).state === "quarantined", governor.tryAcquire(key).state);
+
+  const h = heartbeatHarness({ onHealthy: () => governor.liftQuarantine(key) });
+  h.heartbeat.start();
+  await h.fire();
+  check("lift: one healthy config poll lifts the quarantine and upstream resumes",
+    governor.tryAcquire(key).ok === true, JSON.stringify(governor.state(key)));
+  h.heartbeat.stop();
+  fs.rmSync(stateDir, { recursive: true, force: true });
+}
+
+// The wiring, not just the hand-off: the *default* hook core.js installs must be
+// the one that lifts the quarantine the request path set (no caller glue).
+{
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "glmp-p8-core-"));
+  const config = {
+    UPSTREAM_HOST: "127.0.0.1", BUDGET_REQUESTS_PER_HOUR: 100, MIN_GAP_MS: 0,
+    STATE_DIR: stateDir, HEARTBEAT_INTERVAL_MS: 300_000,
+  };
+  const token = `Bearer ${Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url")}.` +
+    `${Buffer.from(JSON.stringify({ user_id: 777, is_guest: false, iat: 1_700_000_000, exp: 1_700_086_400 })).toString("base64url")}.sig`;
+  const getToken = () => token;
+
+  const governor = getPacingGovernor(config, null, { getToken });
+  governor.recordUpstreamSignal(null, 403, '{"code":410004,"message":"账号已被封禁"}');
+  check("lift (core): the request path's own account is quarantined to start with",
+    governor.tryAcquire().state === "quarantined", governor.tryAcquire().state);
+
+  const timers = [];
+  const hb = getConfigHeartbeat(config, null, {
+    getToken,
+    fetchConfig: async () => [{ id: "zai_glm-5.3-flash" }],
+    setTimer: (fn, ms) => { const t = { fn, ms }; timers.push(t); return t; },
+    clearTimer: () => {},
+    random: () => 0.5,
+  });
+  hb.start();
+  await hb.pollNow();
+  check("lift (core): the default heartbeat hook lifts it — no caller glue, no completion spent",
+    governor.tryAcquire().ok === true, JSON.stringify(governor.state()));
+
+  hb.stop();
+  closeConfigHeartbeats();
+  closePacingGovernors();
+  fs.rmSync(stateDir, { recursive: true, force: true });
 }
 
 // 0 = off, per the repo's convention.
