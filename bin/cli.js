@@ -12,6 +12,7 @@ import {
   getLocalGatewayToken, getIdentityLayer, getPacingGovernor, getConfigHeartbeat, COLORS,
 } from "../lib/core.js";
 import { DEFAULT_PORTS, DEFAULT_HOST, DEFAULT_PROXY_KEY, TEST_PROXY_PORT } from "../lib/constants.js";
+import { describeTokenWindow } from "../lib/governor.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -331,12 +332,11 @@ async function runDoctor() {
         : `${info.windowRequests} requests (budget off)`;
       const guest = info.isGuest ? " (guest)" : "";
       console.log(`  Governor: ${info.state} · ${burn} · account ${info.key}${guest}`);
-      if (info.exp) {
-        const hours = (info.exp * 1000 - Date.now()) / 3_600_000;
-        const expired = hours < 0;
-        const lifetime = info.lifetimeSeconds ? `${Math.round(info.lifetimeSeconds / 3600)}h token` : "token";
-        console.log(`  ${expired ? COLORS.YELLOW : ""}Token   : ${lifetime} · expires ${expired ? "already (re-capture while logged in)" : `in ${hours.toFixed(1)}h`}${expired ? COLORS.RESET : ""}`);
-      }
+      // One line, from the same pure function the suite asserts (Task 7b): a
+      // stale token is a file problem that looks like an account problem, so it
+      // is worth a warning row rather than being absent when it matters most.
+      const window = describeTokenWindow(info);
+      console.log(`  ${window.warn ? COLORS.YELLOW : ""}Token   : ${window.text}${window.warn ? COLORS.RESET : ""}`);
       if (info.diagnosticRequests) {
         console.log(`  Sweeps  : ${info.diagnosticRequests} budget-exempt diagnostic request(s) this session`);
       }

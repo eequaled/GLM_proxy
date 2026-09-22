@@ -29,6 +29,7 @@ import {
   accountKeyFromToken,
   createPacingGovernor,
   decodeJwtClaims,
+  describeTokenWindow,
 } from "../lib/governor.js";
 import { check, post, startProxy, startTlsMock, stopProxy, summary } from "./_helpers.mjs";
 
@@ -480,7 +481,50 @@ checkThat("taxonomy: the other two governor verdicts keep their own shape", () =
   assert.equal(quarantined.permanent, true);
 });
 
-// ── 9. the ban-lift probe (Task 7a, R6.2) ───────────────────────────────────
+// ── 9. the token window the doctor prints (Task 7b) ─────────────────────────
+//
+// The proxy holds a *captured* token. When it dies, upstream answers 401 and the
+// failure reads like account trouble when it is only a stale file, so the
+// operator should learn it from --doctor rather than from a wave of 401s. The
+// row is a pure function of the decoded claims and the clock, which is what
+// makes it assertable here instead of only visible in a CLI printout.
+
+checkThat("token: a fresh token reports the hours left and does not warn", () => {
+  const now = Date.now();
+  const info = { exp: Math.floor(now / 1000) + 12 * 3600, lifetimeSeconds: 86_400 };
+  const w = describeTokenWindow(info, now);
+  assert.equal(w.warn, false);
+  assert.match(w.text, /24h token/);
+  assert.match(w.text, /in 12\.0h/);
+});
+
+checkThat("token: under an hour left it warns and says what to do about it", () => {
+  const now = Date.now();
+  const info = { exp: Math.floor(now / 1000) + 45 * 60, lifetimeSeconds: 86_400 };
+  const w = describeTokenWindow(info, now);
+  assert.equal(w.warn, true);
+  assert.match(w.text, /in 45m/);
+  assert.match(w.text, /re-capture/);
+});
+
+checkThat("token: an already-expired token is the same warning, not a quiet one", () => {
+  const now = Date.now();
+  const info = { exp: Math.floor(now / 1000) - 60, lifetimeSeconds: 86_400 };
+  const w = describeTokenWindow(info, now);
+  assert.equal(w.warn, true);
+  assert.match(w.text, /expired/);
+  assert.match(w.text, /re-capture/);
+});
+
+checkThat("token: claims with no exp say so instead of inventing a window", () => {
+  const unknown = describeTokenWindow({ exp: null, lifetimeSeconds: null }, Date.now());
+  assert.equal(unknown.warn, false);
+  assert.match(unknown.text, /expiry unknown/);
+  assert.equal(describeTokenWindow(null).warn, false);
+  assert.match(describeTokenWindow(null).text, /expiry unknown/);
+});
+
+// ── 10. the ban-lift probe (Task 7a, R6.2) ──────────────────────────────────
 //
 // A ban signal quarantines the account, and quarantine is terminal until
 // something lifts it. It must not be a one-way door: bans do get lifted, and
@@ -561,7 +605,7 @@ await checkThatAsync("lift: an empty catalog is a failed poll, not a healthy one
   assert.equal(h.governor.state().state, "quarantined", "an unusable payload must not be read as a healthy account");
 });
 
-// ── 10. end-to-end: over budget never opens an upstream socket (R3.2) ───────
+// ── 11. end-to-end: over budget never opens an upstream socket (R3.2) ───────
 
 {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "glmp-p7-home-"));
