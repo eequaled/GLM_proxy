@@ -344,7 +344,9 @@ Every failure maps to a semantically correct status with a machine-readable `cod
 | AutoClaw not running (no token file) | `503` | `no_token` |
 | Upstream timeout (default 2 min, see `UPSTREAM_TIMEOUT_MS`) | `504` | `upstream_timeout` |
 
-Quota errors are remembered for 60s per model, so repeat requests fail instantly instead of replaying doomed cloud and fallback attempts.
+Quota errors are remembered for 60s per model, so repeat requests fail instantly instead of replaying doomed attempts.
+
+A capacity throttle (`upstream_busy`, a plain upstream `429`, or a `5xx`) is retried in place before your client sees it: two attempts, about 4 s then about 6 s, jittered. A ban, a quota wall and a bad request are never retried, because another attempt spends time and changes nothing. See [Throttle retries](#throttle-retries-and-why-there-is-no-fallback).
 
 </details>
 
@@ -369,8 +371,8 @@ your IP (one account behind many IPs is still one account).
 |---|---|
 | You cross 80% of the hourly budget | A terminal notice + a log warning, once per window |
 | You reach 100% | `429` `budget_exceeded` with a `Retry-After` header. **Nothing is sent upstream** — no credits are spent |
-| Upstream throttles you (429, or the free-tier "high demand" `810002`) | Exponential backoff with jitter; the retry is held instead of making it worse |
-| Upstream says `410004` (banned) | `403` `account_quarantined`, and upstream calls pause. A ban is permanent for that account — retrying cannot fix it |
+| Upstream throttles you (429, or the free-tier "high demand" `810002`) | The proxy waits a few seconds and sends the same call again, twice. If the wall holds you get `429` `upstream_busy`, and the governor backs off |
+| Upstream says `410004` (banned) | `403` `account_quarantined`. Upstream calls stop, and the ban is never retried. Nothing on this side can undo it: the proxy resumes only if the account starts answering again |
 
 Defaults, and what they mean:
 
@@ -441,11 +443,11 @@ get conflated.
 
 Hardened on master since, all of it currently unreleased:
 
-- Throttles and bans are now terminal for the local desktop-agent fallback. That path re-issues the same cloud call on the same account, so it used to fail identically after wasting up to 120 seconds. In one measured session that cost ~26 minutes out of 50.
+- The desktop-agent fallback is gone. On any cloud failure it re-ran your prompt inside AutoClaw as a full agentic session with tool access, so a throttled call could start a second agent editing the same files you were. A failed run also reached your client as a hard API error, or spent the full 120 s timeout first. One measured session lost about 26 minutes out of 50 to it.
 - A quarantine is no longer a one-way door. The proxy polls the model-config endpoint every 5 minutes anyway, and a `200` from it proves the account answers again — so a ban that upstream later lifts (or a false positive) clears itself instead of waiting for someone to delete a state file. It costs a `GET`, never a completion.
 - `--doctor` prints the token window too: `24h token — expires in 45m; re-capture it while the app is logged in`. A token file that has quietly died used to read like an account problem, because upstream answers `401` for both.
 - A throttle maps to `429 upstream_busy` instead of a generic `403`, so a harness backs off instead of retrying into a wall. Throttle responses also trigger a bounded exponential backoff with jitter instead of an immediate retry.
-- An unknown-model `400` used to hang ~30 s before falling into that fallback. It is a clean `404` in about half a second now.
+- An unknown-model `400` used to hang for ~30 s on doomed retries before giving up. It is a clean `404` in about half a second now.
 - Per-account pacing is the other half of this, and it is documented under [Account safety](#account-safety).
 
 What is still unknown, and said plainly:
@@ -474,16 +476,12 @@ tunes the base wait, `GLMP_THROTTLE_RETRIES` the count (`0` turns retrying off).
 A **ban** (`410004`) or a **quota wall** is never retried. Those are deterministic, so
 another attempt only spends time and digs the hole deeper.
 
-There used to be a second route here. On a cloud failure the proxy re-ran your prompt
-through AutoClaw's own desktop agent over a local WebSocket (`127.0.0.1:18789`) — a full
-agentic run, tools included, opened with `operator.write` scopes inside AutoClaw. It is
-gone, deliberately: it rarely worked, and when it did the work happened inside AutoClaw
-instead of in your harness. Worse, because it ran *your* prompt as a full agent, a
-throttled call could start a second agent with write access to your working directory.
-It also misreported failures — a cloud `500` reached the client as `local_gateway_failed`
-carrying the gateway's connection error, and `PREFER_LOCAL=1` (which skipped the cloud
-entirely and drove that agent) was a hard outage whenever the desktop app was down.
-`PREFER_LOCAL` is now a stated no-op that says so in the log.
+There used to be a second route. On a cloud failure the proxy re-ran your prompt inside
+AutoClaw's desktop agent over a local WebSocket, as a full agentic session with tool
+access, so a throttled call could start a second agent editing the same files you were.
+It rarely worked, and when it did the work happened inside AutoClaw instead of here. It is
+deleted. `PREFER_LOCAL`, the switch that drove it, logs a notice and changes nothing.
+Why it went, with the measurements, is in [Ban risk, and what changed since](#ban-risk-and-what-changed-since).
 
 </details>
 
