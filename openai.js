@@ -346,6 +346,14 @@ async function handleChatCompletions(req, res) {
 
     if (stream) {
       res.writeHead(200, SSE_HEADERS);
+      // `pipe` does not forward source errors to the destination, so a mid-stream
+      // failure — including a decode failure on a compressed upstream body —
+      // would leave the client waiting forever for a [DONE] that never comes.
+      // The 200 is already on the wire, so the honest move is to end the stream.
+      successRes.on("error", (err) => {
+        log.warn(`Upstream stream failed mid-response: ${err.message}`);
+        try { res.end(); } catch (_) {}
+      });
       successRes.pipe(res);
       return;
     }
