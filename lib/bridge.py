@@ -43,9 +43,12 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             timeout = payload.get("timeout", 120)
             impersonate = payload.get("impersonate", "chrome124")
 
+            # Remove pre-existing Content-Length, Host, Transfer-Encoding so curl_cffi computes exact wire values
+            clean_headers = {k: v for k, v in headers.items() if k.lower() not in ("content-length", "host", "transfer-encoding")}
+
             resp = requests.post(
                 url,
-                headers=headers,
+                headers=clean_headers,
                 json=data,
                 impersonate=impersonate,
                 stream=stream,
