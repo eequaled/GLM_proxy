@@ -33,6 +33,7 @@ import {
   getPacingGovernor, classifyGovernorError,
   startConfigHeartbeat, startShapeWatch,
 } from "./lib/core.js";
+import { globalInFlightQueue } from "./lib/queue.js";
 
 // Config (per-format log filenames come from `format`)
 const config = loadConfig({ format: "anthropic" });
@@ -545,6 +546,19 @@ async function handleMessages(req, res) {
 
   const lastMsgForLog = () => lastMessagePreview(openAIBody.messages);
 
+  let cloudEvidence = null;
+  let releaseLock = null;
+  let released = false;
+  const releaseOnce = () => {
+    if (!released) {
+      released = true;
+      if (typeof releaseLock === "function") {
+        releaseLock();
+        releaseLock = null;
+      }
+    }
+  };
+
   try {
     const cachedFailure = permanentFailures.get(modelId);
     if (cachedFailure) {
@@ -563,6 +577,9 @@ async function handleMessages(req, res) {
       record(cls.status, { lastMessage: lastMsgForLog(), messageCount: openAIBody.messages?.length || 0, error: cls.code });
       return sendClassifiedErrorAnthropic(res, cls);
     }
+
+    // Upstream limits accounts to 1 concurrent active generation; serialize in-flight requests
+    releaseLock = await globalInFlightQueue.acquire();
 
     // Cloud call with one retry on the flaky 400 "invalid request" hiccup;
     // every >=400 body is buffered + logged (R1). Shared with openai.js.
@@ -586,6 +603,7 @@ async function handleMessages(req, res) {
 
     // Failure path only — a 2xx falls through to the success renderer below.
     if (statusCode >= 400) {
+      releaseOnce();
       // Classify the verdict the client will see. The classified status is
       // what goes on the wire: a raw 403 meaning "free-tier capacity throttle"
       // (810002) becomes 429 upstream_busy, so a harness backs off instead of
@@ -606,6 +624,8 @@ async function handleMessages(req, res) {
 
     // Success paths
     record(statusCode, { lastMessage: lastMsgForLog(), messageCount: openAIBody.messages?.length || 0 });
+
+    res.on("close", releaseOnce);
 
     if (stream) {
       res.writeHead(200, SSE_HEADERS);
@@ -643,9 +663,14 @@ async function handleMessages(req, res) {
         }
         for (const e of openAIChunkToAnthropicEvents("data: [DONE]", state)) res.write(e);
         res.end();
+        releaseOnce();
       });
 
-      upstreamRes.on("error", (err) => { log.error("Stream error:", err); res.end(); });
+      upstreamRes.on("error", (err) => {
+        log.error("Stream error:", err);
+        try { res.end(); } catch (_) {}
+        releaseOnce();
+      });
       return;
     }
 
@@ -659,9 +684,15 @@ async function handleMessages(req, res) {
       } catch (err) {
         if (!res.headersSent) sendErrorAnthropic(res, `Failed to parse upstream response: ${err.message}`, "api_error", 502, "upstream_parse_failed");
         else { try { res.end(); } catch (_) {} }
+      } finally {
+        releaseOnce();
       }
     });
+    upstreamRes.on("error", (err) => {
+      releaseOnce();
+    });
   } catch (err) {
+    releaseOnce();
     const cls = classifyTransportError(err);
     log.error(`messages model=${body.model} transport failure:`, cls.message);
     if (res.headersSent) { try { res.end(); } catch (_) {} return; }
