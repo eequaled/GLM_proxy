@@ -33,7 +33,9 @@ glmproxy --anthropic --port 3001 --key mykey
 
 Then point any OpenAI-compatible tool at `http://127.0.0.1:18791/v1`, or any Anthropic-compatible tool at `http://127.0.0.1:18792`. Default key is `mewmew` (see [Integrations](#integrations) below for exact per-tool setup).
 
-**You need:** [AutoClaw](https://autoclaw.z.ai) installed, running, and logged in (Windows/macOS), plus Node.js 18+. The proxy reads auth straight from AutoClaw's local token file, so there's no manual token setup and no API keys to copy.
+**You need:** [AutoClaw](https://autoclaw.z.ai) installed, running, and logged in:
+- **Windows / macOS**: AutoClaw 1.x or 2.x desktop app running. Auth is automatically read from AutoClaw's local runtime state.
+- **Linux**: AutoClaw 2.0.3 AppImage running. The proxy automatically discovers and syncs account tokens from the system Secret Service / GNOME Keyring vault with zero manual setup. For Linux TLS compatibility matching AutoClaw's Electron fingerprint, ensure `curl_cffi` is installed (`pip install curl_cffi`). Node.js 18+ required on all platforms.
 
 ---
 
@@ -160,24 +162,48 @@ AutoClaw handles authentication automatically. The cloud is the only route: if i
 
 ## Current available models in autoclaw
 
+The proxy dynamically serves the correct model catalog for your platform and AutoClaw version.
+
+### Windows (AutoClaw 1.x / 2.x)
+
 | ID | Name | Context | Max Output | Notes |
 |----|------|---------|------------|-------|
 | `zai_auto` | Auto | 1M | 131K | Routes to AutoClaw's optimal model (GLM-5.3-Flash today) |
 | `zaicoding_glm-5.3` | GLM-5.3 | 1M | 131K | Latest GLM coding model |
 | `zai_glm-5-turbo` | GLM-5-Turbo | 200K | 131K | Zhipu AI GLM-5 Turbo |
-| `zai_glm-5.3-flash` | GLM-5.3-Flash ("OX-alpha") | 1M | 131K | Now a regular catalog model, served straight through the cloud path |
-| `tdpsk_deepseek-v4-flash-202605` | Deepseek-V4-Flash | 1M | 393K | Fast DeepSeek model |
-| `tdpsk_deepseek-v4-pro-202606` | DeepSeek-V4-Pro | 1M | 393K | Deep reasoning model |
+| `zai_glm-5.3-flash` | GLM-5.3-Flash ("OX-alpha") | 1M | 131K | Fast high-throughput GLM model |
+| `tdpsk_deepseek-v4-flash-202605` | Deepseek-V4-Flash | 1M | 393K | Fast DeepSeek model (Windows upstream catalog) |
+| `tdpsk_deepseek-v4-pro-202606` | DeepSeek-V4-Pro | 1M | 393K | Deep reasoning model (Windows upstream catalog) |
 
-> GLM 5.3 flash new in the proxy!!!!! ox alpha the goat
+### Linux (AutoClaw 2.0.3)
 
-The catalog is re-read from AutoClaw's `openclaw.runtime.json` on every `/v1/models` call, with a built-in fallback if that file isn't readable. Run `glmproxy --doctor` to inspect the current catalog after an AutoClaw update. Claude model names sent to the Anthropic proxy are mapped automatically:
+On Linux, AutoClaw 2.0.3 natively exposes **4 models** in its upstream runtime catalog (DeepSeek models and GLM-5-Turbo are not present in Linux 2.x upstream):
+
+| ID | Name | Context | Max Output | Notes |
+|----|------|---------|------------|-------|
+| `zai_auto` | Auto | 1M | 131K | Routes to AutoClaw's default model |
+| `zai_auto-fast` | Auto-Fast | 1M | 131K | Lightweight fast auto-routing |
+| `zaicoding_glm-5.3` | GLM-5.3 | 1M | 131K | Latest GLM coding model |
+| `zai_glm-5.3-flash` | GLM-5.3-Flash | 1M | 131K | Fast high-throughput GLM model |
+
+The catalog is re-read dynamically from AutoClaw's runtime snapshot on every `/v1/models` call, degrading to the platform-appropriate fallback catalog if the snapshot is unreadable. Run `glmproxy --doctor` to inspect the current catalog after an AutoClaw update. Claude model names sent to the Anthropic proxy are mapped automatically:
 
 | Claude model | Routes to |
 |---|---|
 | `claude-opus-*` | First available GLM-5.3 / GLM-5 model |
 | `claude-sonnet-*` | `zai_auto` (or next available GLM-5 model) |
-| `claude-haiku-*` | `zai_glm-5-turbo` (or DeepSeek / Auto fallback) |
+| `claude-haiku-*` | `zai_glm-5.3-flash` / `zai_glm-5-turbo` |
+
+---
+
+## Subagent & Concurrency Support (In-Flight Queue)
+
+Upstream AutoClaw strictly limits accounts to **1 active generation at a time**. In environments that spawn autonomous subagents, background tools, or parallel turns (e.g. Claude Code subagents, Cursor Agent parallel tool calls, OpenCode multi-tasking), simultaneous requests previously caused upstream `HTTP 406 (upstream_failure)` errors.
+
+GLM Proxy includes a built-in serialized FIFO in-flight queue (`InFlightQueue`):
+- Concurrent requests automatically wait in-process until the active stream finishes.
+- Once the stream completes, queued requests immediately dispatch to upstream.
+- Prevents 406 concurrency collisions while ensuring zero dropped requests or failed turns.
 
 ---
 

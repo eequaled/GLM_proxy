@@ -133,14 +133,17 @@ function resolveModel(anthropicModel) {
 
 // Convert an Anthropic Messages request body to OpenAI chat/completions format.
 function anthropicToOpenAI(body, modelId) {
+  const sanitize = (s) => typeof s === "string" ? s.replace(/Claude Agent SDK/g, "Agent SDK") : s;
   const messages = [];
 
   // System prompt
   if (body.system) {
     const text = typeof body.system === "string"
       ? body.system
-      : body.system.filter((b) => b.type === "text").map((b) => b.text).join("\n");
-    if (text) messages.push({ role: "system", content: text });
+      : (Array.isArray(body.system)
+          ? body.system.map((b) => typeof b === "string" ? b : (b.type === "text" ? b.text : (b.text || ""))).filter(Boolean).join("\n")
+          : "");
+    if (text) messages.push({ role: "system", content: sanitize(text) });
   }
 
   // Convert messages
@@ -148,7 +151,7 @@ function anthropicToOpenAI(body, modelId) {
     const content = msg.content;
 
     if (typeof content === "string") {
-      messages.push({ role: msg.role, content });
+      messages.push({ role: msg.role, content: sanitize(content) });
       continue;
     }
 
@@ -175,7 +178,7 @@ function anthropicToOpenAI(body, modelId) {
     for (const block of content) {
       if (block.type === "tool_result")      toolResults.push(block);
       else if (block.type === "tool_use")    toolUses.push(block);
-      else if (block.type === "text")        textParts.push(block.text);
+      else if (block.type === "text")        textParts.push(sanitize(block.text));
       else if (block.type === "image")       { const p = toOpenAIImage(block); if (p) imageParts.push(p); }
       else if (block.type === "thinking")    { /* skip */ }
     }

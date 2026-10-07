@@ -255,9 +255,10 @@ check("resolveUpstreamModelId keeps known ids, maps auto, prefixes others", () =
 
 // ── Fallback model catalog ─────────────────────────────────────────────────
 
-check("fallback catalog ships four models incl glm-5.3-flash", () => {
+check("fallback catalog ships expected models incl glm-5.3-flash", () => {
   const cfg = loadConfig({ format: "openai" });
-  assert.ok(Array.isArray(cfg.FALLBACK_MODELS) && cfg.FALLBACK_MODELS.length === 4);
+  const expectedCount = process.platform === "linux" ? 4 : 6;
+  assert.ok(Array.isArray(cfg.FALLBACK_MODELS) && cfg.FALLBACK_MODELS.length === expectedCount);
   assert.ok(cfg.FALLBACK_MODELS.some((m) => m.id === "zai_glm-5.3-flash"));
 });
 
