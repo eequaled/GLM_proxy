@@ -58,10 +58,17 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(resp.status_code)
             for k, v in resp.headers.items():
                 k_lower = k.lower()
-                if k_lower in ("content-type", "content-encoding", "vary"):
+                if k_lower in ("content-type", "vary"):
                     self.send_header(k, v)
 
-            if stream:
+            if resp.status_code >= 400:
+                body = resp.content
+                sys.stderr.write(f"[BRIDGE] Upstream error {resp.status_code}: {resp.text[:500]}\n")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+            elif stream:
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
                 for chunk in resp.iter_content(chunk_size=None):

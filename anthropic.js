@@ -613,7 +613,7 @@ async function handleMessages(req, res) {
       // retrying into a wall.
       const cls = classifyUpstreamError(statusCode, upstreamErrBody, modelId);
       if (cls.permanent) permanentFailures.mark(modelId, cls);
-      log.error(`Upstream error ${statusCode}:`, cls.message);
+      log.error(`Upstream error ${statusCode}:`, cls.message, upstreamErrBody ? `Body: ${upstreamErrBody.slice(0, 500)}` : "(empty body)");
       cloudEvidence = { status: statusCode, code: cls.code };
 
       record(cls.status, {
