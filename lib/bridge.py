@@ -56,9 +56,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             )
 
             self.send_response(resp.status_code)
-            for k, v in resp.headers.items():
-                k_lower = k.lower()
-                if k_lower in ("content-type", "vary"):
+            ALLOWED_HEADERS = {"content-type", "vary", "set-cookie", "retry-after"}
+            header_items = resp.headers.multi_items() if hasattr(resp.headers, "multi_items") else resp.headers.items()
+            for k, v in header_items:
+                if k.lower() in ALLOWED_HEADERS:
                     self.send_header(k, v)
 
             if resp.status_code >= 400:

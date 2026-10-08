@@ -85,25 +85,54 @@ test("syncTokenToHeadersFile atomically writes valid headers format", () => {
 test("createTokenLayer loads from vault and syncs to token file", () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-layer-test-"));
   const tokenFile = path.join(tmpDir, "request-headers.json");
-  const config = {
-    TOKEN_FILE: tokenFile,
-    TOKEN_TTL_MS: 10000,
-  };
+  const accountsDir = path.join(tmpDir, "accounts", "test-user");
+  fs.mkdirSync(accountsDir, { recursive: true });
 
-  const logs = [];
-  const log = {
-    info: (msg) => logs.push(msg),
-    warn: (msg) => logs.push(msg),
-    error: (msg) => logs.push(msg),
-  };
+  const password = "test-master-password";
+  const plaintext = JSON.stringify({
+    schemaVersion: 1,
+    accessToken: "Bearer mock-vault-token-xyz",
+    refreshToken: "mock-refresh-xyz",
+  });
+  const key = crypto.pbkdf2Sync(password, "saltysalt", 1, 16, "sha1");
+  const iv = Buffer.alloc(16, 0x20);
+  const cipher = crypto.createCipheriv("aes-128-cbc", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(Buffer.from(plaintext, "utf8")), cipher.final()]);
+  const encBuffer = Buffer.concat([Buffer.from("v11", "utf8"), ciphertext]);
+  fs.writeFileSync(path.join(accountsDir, "account-credentials.enc"), encBuffer);
 
-  const layer = createTokenLayer(config, log);
-  const token = layer.getToken();
+  const prevConfigDir = process.env.AUTOCLAW_CONFIG_DIR;
+  const prevKeyringPw = process.env.GLMP_KEYRING_PASSWORD;
 
-  assert.ok(typeof token === "string");
-  assert.ok(token.startsWith("Bearer "));
-  assert.ok(fs.existsSync(tokenFile));
+  process.env.AUTOCLAW_CONFIG_DIR = tmpDir;
+  process.env.GLMP_KEYRING_PASSWORD = password;
 
-  const synced = JSON.parse(fs.readFileSync(tokenFile, "utf8"));
-  assert.equal(synced.headers["X-Authorization"], token);
+  try {
+    const config = {
+      TOKEN_FILE: tokenFile,
+      TOKEN_TTL_MS: 10000,
+    };
+
+    const logs = [];
+    const log = {
+      info: (msg) => logs.push(msg),
+      warn: (msg) => logs.push(msg),
+      error: (msg) => logs.push(msg),
+    };
+
+    const layer = createTokenLayer(config, log);
+    const token = layer.getToken();
+
+    assert.equal(token, "Bearer mock-vault-token-xyz");
+    assert.ok(fs.existsSync(tokenFile));
+
+    const synced = JSON.parse(fs.readFileSync(tokenFile, "utf8"));
+    assert.equal(synced.headers["X-Authorization"], "Bearer mock-vault-token-xyz");
+  } finally {
+    if (prevConfigDir !== undefined) process.env.AUTOCLAW_CONFIG_DIR = prevConfigDir;
+    else delete process.env.AUTOCLAW_CONFIG_DIR;
+    if (prevKeyringPw !== undefined) process.env.GLMP_KEYRING_PASSWORD = prevKeyringPw;
+    else delete process.env.GLMP_KEYRING_PASSWORD;
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+  }
 });

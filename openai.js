@@ -268,7 +268,12 @@ async function handleChatCompletions(req, res) {
     record(successRes.statusCode, { model: modelId, lastMessage: lastMsgForLog(), messageCount: body.messages?.length || 0 });
     log.debug(`← upstream status=${successRes.statusCode}`);
 
-    res.on("close", releaseOnce);
+    res.on("close", () => {
+      if (!res.writableFinished && successRes && !successRes.destroyed) {
+        try { successRes.destroy(); } catch (_) {}
+      }
+      releaseOnce();
+    });
 
     if (stream) {
       res.writeHead(200, SSE_HEADERS);

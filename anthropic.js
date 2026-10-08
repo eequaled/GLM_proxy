@@ -628,7 +628,12 @@ async function handleMessages(req, res) {
     // Success paths
     record(statusCode, { lastMessage: lastMsgForLog(), messageCount: openAIBody.messages?.length || 0 });
 
-    res.on("close", releaseOnce);
+    res.on("close", () => {
+      if (!res.writableFinished && upstreamRes && !upstreamRes.destroyed) {
+        try { upstreamRes.destroy(); } catch (_) {}
+      }
+      releaseOnce();
+    });
 
     if (stream) {
       res.writeHead(200, SSE_HEADERS);
@@ -692,6 +697,12 @@ async function handleMessages(req, res) {
       }
     });
     upstreamRes.on("error", (err) => {
+      log.error("Non-stream upstream error:", err);
+      if (!res.headersSent) {
+        sendErrorAnthropic(res, `Upstream stream failed: ${err.message}`, "api_error", 502, "upstream_failed");
+      } else {
+        try { res.end(); } catch (_) {}
+      }
       releaseOnce();
     });
   } catch (err) {
