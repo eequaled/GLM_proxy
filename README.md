@@ -14,7 +14,7 @@
   <img src="https://github.com/eequaled/GLM_proxy/actions/workflows/ci.yml/badge.svg" alt="CI">
 </p>
 
-<p align="center"><sub>v2.6.0. One CLI, two API formats, zero dependencies.</sub></p>
+<p align="center"><sub>v3.0.0. One CLI, two API formats, zero dependencies.</sub></p>
 
 ---
 
@@ -41,7 +41,7 @@ Then point any OpenAI-compatible tool at `http://127.0.0.1:18791/v1`, or any Ant
 
 ## Integrations
 
-### Claude Code CLI
+### Claude Code CLI & Anthropic API
 
 Add to `~/.claude/settings.json`:
 
@@ -54,7 +54,17 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
+#### Supported Modes & Known Caveats:
+- **Claude Agent SDK & Direct API**: Fully supported. Direct `/v1/messages` calls, streaming SSE deltas, thinking blocks, and tool use execute cleanly without restrictions.
+- **Claude Code CLI (Print Mode)**: Works reliably for CLI tasks using the `-p` / non-interactive flag across Opus, Sonnet, and Haiku models:
+  ```bash
+  claude -p "Explain the codebase architecture"
+  ```
+- **Interactive Mode Notice**: Running interactive `claude` sessions injects Claude Code's internal auto-mode security classifier prompt (a ~285 KB / 71,000+ token evaluation prompt with multi-tier session hooks) which triggers an upstream `HTTP 406 Not Acceptable` filter from AutoClaw. For interactive agentic sessions, use the OpenAI-compatible endpoint (`http://localhost:18791/v1`) with Cursor, OpenCode, or Continue, or run Claude Code in print mode (`-p`).
+
 ### OpenCode
+
+Add to your OpenCode configuration (or select auto-discovered models from `/v1/models`):
 
 ```json
 {
@@ -68,15 +78,15 @@ Add to `~/.claude/settings.json`:
       },
       "models": {
         "zai_auto": { "name": "AutoClaw Auto" },
+        "zai_auto-fast": { "name": "AutoClaw Auto-Fast" },
         "zaicoding_glm-5.3": { "name": "AutoClaw GLM-5.3" },
-        "zai_glm-5-turbo": { "name": "AutoClaw GLM-5 Turbo" },
-        "tdpsk_deepseek-v4-flash-202605": { "name": "AutoClaw Deepseek-V4-Flash" },
-        "tdpsk_deepseek-v4-pro-202606": { "name": "AutoClaw DeepSeek-V4-Pro" }
+        "zai_glm-5.3-flash": { "name": "AutoClaw GLM-5.3 Flash" }
       }
     }
   }
 }
 ```
+*(On Windows, `zai_glm-5-turbo`, `tdpsk_deepseek-v4-flash-202605`, and `tdpsk_deepseek-v4-pro-202606` are also available in the catalog).*
 
 ### Cursor / Continue / anything OpenAI-compatible
 
@@ -186,13 +196,15 @@ On Linux, AutoClaw 2.0.3 natively exposes **4 models** in its upstream runtime c
 | `zaicoding_glm-5.3` | GLM-5.3 | 1M | 131K | Latest GLM coding model |
 | `zai_glm-5.3-flash` | GLM-5.3-Flash | 1M | 131K | Fast high-throughput GLM model |
 
+> **Platform Model Differences**: AutoClaw 2.0.3 AppImage on Linux natively provisions the 4 core ZAI models above in its runtime catalog. DeepSeek models (`tdpsk_*`) and `zai_glm-5-turbo` are served exclusively on Windows AutoClaw installations. The proxy dynamically inspects your environment and serves the correct model set at runtime.
+
 The catalog is re-read dynamically from AutoClaw's runtime snapshot on every `/v1/models` call, degrading to the platform-appropriate fallback catalog if the snapshot is unreadable. Run `glmproxy --doctor` to inspect the current catalog after an AutoClaw update. Claude model names sent to the Anthropic proxy are mapped automatically:
 
-| Claude model | Routes to |
-|---|---|
-| `claude-opus-*` | First available GLM-5.3 / GLM-5 model |
-| `claude-sonnet-*` | `zai_auto` (or next available GLM-5 model) |
-| `claude-haiku-*` | `zai_glm-5.3-flash` / `zai_glm-5-turbo` |
+| Claude model | Routes to (Linux) | Routes to (Windows) |
+|---|---|---|
+| `claude-opus-*` | `zaicoding_glm-5.3` | `zaicoding_glm-5.3` |
+| `claude-sonnet-*` | `zaicoding_glm-5.3` / `zai_auto` | `zaicoding_glm-5.3` / `zai_auto` |
+| `claude-haiku-*` | `zai_glm-5.3-flash` | `zai_glm-5.3-flash` / `zai_glm-5-turbo` |
 
 ---
 
@@ -567,8 +579,9 @@ TRUSTED_PROXIES=127.0.0.1 glmproxy --host 0.0.0.0
 - Upstream 400 `"invalid request"` gets one retry after a 2s delay (a known upstream hiccup). Quota/plan errors are never retried
 - The cloud upstream requires AutoClaw's app system-prompt banner in every request. The proxy injects it automatically and never duplicates it. In practice it doesn't change much since your harness's own system prompt overrides it anyway
 - Max output is clamped to each model's real upstream cap (131K for every GLM model, 393K for DeepSeek). AutoClaw's runtime catalog overstates GLM-5.3's cap (307K), and asking the cloud for more than a model's real cap makes it **silently run a DeepSeek model instead and bill DeepSeek credits** — the proxy clamps so your `zai_glm-5.3` stays GLM-5.3
-- Images pass through natively: pasted/attached images (`image_url` data URLs, Anthropic `image` blocks) reach vision-capable models (e.g. `zai_glm-5.3-flash`) as real image parts — the model sees them directly, no OCR bridge. Text-only models reject them upstream and the request falls back to the desktop agent, mirroring AutoClaw's own gating
-- The token file is watched for changes, so AutoClaw can rotate auth mid-session without a restart
+- Images pass through natively: pasted/attached images (`image_url` data URLs, Anthropic `image` blocks) reach vision-capable models (e.g. `zai_glm-5.3-flash`) as real image parts — the model sees them directly, no OCR bridge.
+- The token file is watched for changes, so AutoClaw can rotate auth mid-session without a restart. On Linux, AutoClaw 2.0.3 vault tokens from the Secret Service / GNOME Keyring are automatically decrypted and synced with MD5 auth signatures.
+- Upstream limits accounts to 1 concurrent generation: parallel requests from subagents or concurrent sessions are queued in-process in FIFO order, eliminating upstream 406 collisions.
 - AutoClaw's client identity (app version, platform, channel) loads dynamically from its runtime file, same as the model catalog, so an AutoClaw app update is picked up without editing or restarting the proxy
 - The fallback model catalog lives in `lib/fallback-models.json` (override with `FALLBACK_MODELS_PATH`). The built-in list is only a last resort when AutoClaw's runtime file is unreadable
 - A capacity throttle is retried in-process (two attempts, about 4 s then 6 s) so a transient "high demand" wall does not stop your harness. A ban or a quota wall is never retried
