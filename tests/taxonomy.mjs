@@ -53,6 +53,53 @@ check("积分不足 body on any status → quota", () => {
   assert.equal(c.permanent, true);
 });
 
+// ── Linux generation detection (spec/linux-support Task 3) ───────────────────
+
+{
+  const prevRoot = process.env.AUTOCLAW_USER_DATA_ROOT;
+  const prevOurs = process.env.AUTOCLAW_CONFIG_DIR;
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const prevFlag = process.env.GLMP_AUTOCLAW2;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taxonomy-autoclaw2-"));
+  delete process.env.AUTOCLAW_CONFIG_DIR;
+  delete process.env.XDG_CONFIG_HOME;
+  delete process.env.GLMP_AUTOCLAW2;
+
+  check("no vault and no override → not autoclaw 2.x", () => {
+    process.env.AUTOCLAW_USER_DATA_ROOT = root;
+    assert.equal(loadConfig({ format: "openai" }).IS_AUTOCLAW2, false);
+  });
+
+  check("a discovered vault means autoclaw 2.x", () => {
+    const accountDir = path.join(root, "accounts", "a".repeat(64));
+    fs.mkdirSync(accountDir, { recursive: true });
+    fs.writeFileSync(path.join(accountDir, "account-credentials.enc"), "v10x");
+    assert.equal(loadConfig({ format: "openai" }).IS_AUTOCLAW2, true);
+    fs.rmSync(path.join(root, "accounts"), { recursive: true, force: true });
+  });
+
+  check("GLMP_AUTOCLAW2 overrides the probe in both directions", () => {
+    process.env.GLMP_AUTOCLAW2 = "1";
+    assert.equal(loadConfig({ format: "openai" }).IS_AUTOCLAW2, true);
+    const accountDir = path.join(root, "accounts", "b".repeat(64));
+    fs.mkdirSync(accountDir, { recursive: true });
+    fs.writeFileSync(path.join(accountDir, "account-credentials.enc"), "v10x");
+    process.env.GLMP_AUTOCLAW2 = "0";
+    assert.equal(loadConfig({ format: "openai" }).IS_AUTOCLAW2, false);
+    fs.rmSync(path.join(root, "accounts"), { recursive: true, force: true });
+  });
+
+  if (prevRoot === undefined) delete process.env.AUTOCLAW_USER_DATA_ROOT;
+  else process.env.AUTOCLAW_USER_DATA_ROOT = prevRoot;
+  if (prevOurs === undefined) delete process.env.AUTOCLAW_CONFIG_DIR;
+  else process.env.AUTOCLAW_CONFIG_DIR = prevOurs;
+  if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = prevXdg;
+  if (prevFlag === undefined) delete process.env.GLMP_AUTOCLAW2;
+  else process.env.GLMP_AUTOCLAW2 = prevFlag;
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
 check("401 → authentication_error", () => {
   const c = classifyUpstreamError(401, "", "m");
   assert.equal(c.status, 401);
