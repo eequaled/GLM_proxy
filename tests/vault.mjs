@@ -53,7 +53,7 @@ function fakeJwt(payloadObj) {
   return `${header}.${payload}.sig`;
 }
 
-function encryptV11(plaintextObj, password) {
+function encryptV11(plaintextObj, password, prefix = "v11") {
   const key = crypto.pbkdf2Sync(password, "saltysalt", 1, 16, "sha1");
   const iv = Buffer.alloc(16, 0x20);
   const cipher = crypto.createCipheriv("aes-128-cbc", key, iv);
@@ -61,7 +61,7 @@ function encryptV11(plaintextObj, password) {
     cipher.update(Buffer.from(JSON.stringify(plaintextObj), "utf8")),
     cipher.final(),
   ]);
-  return Buffer.concat([Buffer.from("v11", "utf8"), body]);
+  return Buffer.concat([Buffer.from(prefix, "utf8"), body]);
 }
 
 // ── Discovery ────────────────────────────────────────────────────────────────
@@ -87,7 +87,11 @@ function encryptV11(plaintextObj, password) {
 {
   const root = tmp("vault-override-");
   const other = tmp("vault-override-other-");
-  const prev = process.env.AUTOCLAW_CONFIG_DIR;
+  const prevDir = process.env.AUTOCLAW_CONFIG_DIR;
+  const prevAppRoot = process.env.AUTOCLAW_USER_DATA_ROOT;
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  delete process.env.AUTOCLAW_USER_DATA_ROOT;
+  delete process.env.XDG_CONFIG_HOME;
   process.env.AUTOCLAW_CONFIG_DIR = root;
   try {
     makeVault(other, "ignored-account", 2_000_000_000);
@@ -101,9 +105,40 @@ function encryptV11(plaintextObj, password) {
       assert.equal(vaults.length, 1);
       assert.equal(vaults[0].accountDir, path.join(root, "accounts", "visible-account"));
     });
+
+    check("the app's own AUTOCLAW_USER_DATA_ROOT outranks our override", () => {
+      process.env.AUTOCLAW_USER_DATA_ROOT = other;
+      assert.deepEqual(getAutoClawConfigDirs(), [other]);
+      // discovery follows it too
+      const vaults = findAutoClawVaults();
+      assert.equal(vaults.length, 1);
+      assert.equal(vaults[0].accountDir, path.join(other, "accounts", "ignored-account"));
+      delete process.env.AUTOCLAW_USER_DATA_ROOT;
+    });
+
+    check("XDG_CONFIG_HOME relocates the default AutoClaw root", () => {
+      const xdgRoot = tmp("vault-xdg-");
+      makeVault(xdgRoot, "xdg-account", 1_000_000_000);
+      delete process.env.AUTOCLAW_CONFIG_DIR;
+      process.env.XDG_CONFIG_HOME = xdgRoot;
+      try {
+        assert.deepEqual(getAutoClawConfigDirs(), [path.join(xdgRoot, "AutoClaw")]);
+        const vaults = findAutoClawVaults();
+        assert.equal(vaults.length, 1);
+        assert.equal(vaults[0].accountDir, path.join(xdgRoot, "AutoClaw", "accounts", "xdg-account"));
+      } finally {
+        delete process.env.XDG_CONFIG_HOME;
+        process.env.AUTOCLAW_CONFIG_DIR = root;
+      }
+      fs.rmSync(xdgRoot, { recursive: true, force: true });
+    });
   } finally {
-    if (prev === undefined) delete process.env.AUTOCLAW_CONFIG_DIR;
-    else process.env.AUTOCLAW_CONFIG_DIR = prev;
+    if (prevAppRoot === undefined) delete process.env.AUTOCLAW_USER_DATA_ROOT;
+    else process.env.AUTOCLAW_USER_DATA_ROOT = prevAppRoot;
+    if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prevXdg;
+    if (prevDir === undefined) delete process.env.AUTOCLAW_CONFIG_DIR;
+    else process.env.AUTOCLAW_CONFIG_DIR = prevDir;
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(other, { recursive: true, force: true });
   }
@@ -146,14 +181,15 @@ function encryptV11(plaintextObj, password) {
 
 {
   const prev = process.env.AUTOCLAW_CONFIG_DIR;
+  const prevXdg = process.env.XDG_CONFIG_HOME;
   delete process.env.AUTOCLAW_CONFIG_DIR;
+  delete process.env.XDG_CONFIG_HOME;
   try {
-    check("default roots point at both known config dirs under home", () => {
+    check("default roots are the observed AutoClaw root plus the reported one", () => {
       const dirs = getAutoClawConfigDirs();
       assert.equal(dirs.length, 2);
-      assert.ok(dirs[0].startsWith(path.join(os.homedir(), ".config")));
-      assert.equal(dirs[1], path.join(os.homedir(), ".config", "AutoClaw"));
-      assert.equal(dirs[0], path.join(os.homedir(), ".config", "AutoClaw-oversea-official"));
+      assert.equal(dirs[0], path.join(os.homedir(), ".config", "AutoClaw"));
+      assert.equal(dirs[1], path.join(os.homedir(), ".config", "AutoClaw-oversea-official"));
     });
     check("default discovery returns an array without throwing", () => {
       assert.ok(Array.isArray(findAutoClawVaults()));
@@ -162,6 +198,8 @@ function encryptV11(plaintextObj, password) {
   } finally {
     if (prev === undefined) delete process.env.AUTOCLAW_CONFIG_DIR;
     else process.env.AUTOCLAW_CONFIG_DIR = prev;
+    if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prevXdg;
   }
 }
 
@@ -200,9 +238,14 @@ check("isJwtExpired treats a non-jwt or exp-less token as unexpired", () => {
   const enc = encryptV11(plaintext, password);
 
   check("v11 payload round-trips to the accessToken", () => {
-    const creds = decryptCredentials(enc, password);
+    const creds = decryptCredentials(encryptV11(plaintext, password, "v11"), password);
     assert.equal(creds.accessToken, "Bearer decrypted-secret-token");
     assert.equal(creds.refreshToken, "refresh-123");
+  });
+
+  check("v10 payload round-trips too (what linux electron actually writes)", () => {
+    const creds = decryptCredentials(encryptV11(plaintext, password, "v10"), password);
+    assert.equal(creds.accessToken, "Bearer decrypted-secret-token");
   });
 
   check("wrong password throws instead of returning junk", () => {
