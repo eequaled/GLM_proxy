@@ -15,7 +15,9 @@ import {
   parseJwtPayload,
   isJwtExpired,
   decryptCredentials,
+  extractAutoClawVaultToken,
 } from "../lib/vault.js";
+import { createTokenLayer } from "../lib/core.js";
 
 function tmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -220,6 +222,176 @@ check("isJwtExpired treats a non-jwt or exp-less token as unexpired", () => {
     assert.throws(() => decryptCredentials(enc, null));
     assert.throws(() => decryptCredentials(enc, ""));
   });
+}
+
+// ── Key chain + extraction ───────────────────────────────────────────────────
+
+function writeEncryptedVault(root, accountId, password, plaintext, mtimeEpochSec = 1_000_000_000) {
+  const accountDir = path.join(root, "accounts", accountId);
+  fs.mkdirSync(accountDir, { recursive: true });
+  const encFile = path.join(accountDir, "account-credentials.enc");
+  fs.writeFileSync(encFile, encryptV11(plaintext, password));
+  const t = new Date(mtimeEpochSec * 1000);
+  fs.utimesSync(encFile, t, t);
+  fs.writeFileSync(path.join(accountDir, "account-profile.json"),
+    JSON.stringify({ profile: { displayName: `operator-${accountId}` } }));
+  return encFile;
+}
+
+function spyLog() {
+  const msgs = [];
+  return {
+    msgs,
+    info: (m) => msgs.push(m),
+    warn: (m) => msgs.push(m),
+    error: (m) => msgs.push(m),
+    debug: (m) => msgs.push(m),
+  };
+}
+
+const KEYRING_PASSWORD = "test-master-password";
+
+{
+  const root = tmp("vault-keychain-");
+  const prevDir = process.env.AUTOCLAW_CONFIG_DIR;
+  const prevPw = process.env.GLMP_KEYRING_PASSWORD;
+  process.env.AUTOCLAW_CONFIG_DIR = root;
+  process.env.GLMP_KEYRING_PASSWORD = KEYRING_PASSWORD;
+  try {
+    writeEncryptedVault(root, "acct-1", KEYRING_PASSWORD, {
+      schemaVersion: 1,
+      accessToken: "Bearer vault-jwt-one",
+      refreshToken: "refresh-1",
+    });
+
+    check("env keyring password unlocks the vault and reports the account", () => {
+      const log = spyLog();
+      const res = extractAutoClawVaultToken({}, log);
+      assert.equal(res.token, "Bearer vault-jwt-one");
+      assert.equal(res.profile.displayName, "operator-acct-1");
+      assert.ok(log.msgs.some((m) => String(m).includes("operator-acct-1")));
+    });
+
+    check("wrong keyring password degrades to null with one warning, never throws", () => {
+      process.env.GLMP_KEYRING_PASSWORD = "wrong-password";
+      const log = spyLog();
+      const res = extractAutoClawVaultToken({}, log);
+      assert.equal(res, null);
+      assert.equal(log.msgs.length, 1);
+      process.env.GLMP_KEYRING_PASSWORD = KEYRING_PASSWORD;
+    });
+
+    check("no password and no keyring daemon → null, never throws", () => {
+      delete process.env.GLMP_KEYRING_PASSWORD;
+      const log = spyLog();
+      const res = extractAutoClawVaultToken({}, log);
+      assert.equal(res, null);
+      assert.ok(log.msgs.length >= 1);
+    });
+  } finally {
+    if (prevDir === undefined) delete process.env.AUTOCLAW_CONFIG_DIR;
+    else process.env.AUTOCLAW_CONFIG_DIR = prevDir;
+    if (prevPw === undefined) delete process.env.GLMP_KEYRING_PASSWORD;
+    else process.env.GLMP_KEYRING_PASSWORD = prevPw;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// ── Token layer delegation ───────────────────────────────────────────────────
+
+function writeLegacyHeaders(file, token) {
+  fs.writeFileSync(file, JSON.stringify({ headers: { "X-Authorization": token } }));
+}
+
+{
+  const root = tmp("vault-tokenlayer-");
+  const prevDir = process.env.AUTOCLAW_CONFIG_DIR;
+  const prevPw = process.env.GLMP_KEYRING_PASSWORD;
+  const prevDirect = process.env.GLMP_AUTOCLAW_TOKEN;
+  process.env.AUTOCLAW_CONFIG_DIR = root;
+  process.env.GLMP_KEYRING_PASSWORD = KEYRING_PASSWORD;
+  delete process.env.GLMP_AUTOCLAW_TOKEN;
+  const legacyFile = path.join(root, "request-headers.json");
+  try {
+    writeEncryptedVault(root, "acct-1", KEYRING_PASSWORD, { accessToken: "Bearer vault-jwt" });
+    writeLegacyHeaders(legacyFile, "Bearer legacy-jwt");
+    const cfg = { TOKEN_FILE: legacyFile, TOKEN_TTL_MS: 60_000, IS_AUTOCLAW2: true };
+
+    check("vault token wins over the legacy headers file", () => {
+      const layer = createTokenLayer(cfg, spyLog());
+      assert.equal(layer.getToken(), "Bearer vault-jwt");
+    });
+
+    check("GLMP_VAULT=0 restores the legacy-file path", () => {
+      const prevVault = process.env.GLMP_VAULT;
+      process.env.GLMP_VAULT = "0";
+      try {
+        const layer = createTokenLayer(cfg, spyLog());
+        assert.equal(layer.getToken(), "Bearer legacy-jwt");
+      } finally {
+        if (prevVault === undefined) delete process.env.GLMP_VAULT;
+        else process.env.GLMP_VAULT = prevVault;
+      }
+    });
+
+    check("direct env token short-circuits vault and file entirely", () => {
+      process.env.GLMP_AUTOCLAW_TOKEN = "Bearer direct-jwt";
+      try {
+        const layer = createTokenLayer({ ...cfg, IS_AUTOCLAW2: false }, spyLog());
+        assert.equal(layer.getToken(), "Bearer direct-jwt");
+      } finally {
+        delete process.env.GLMP_AUTOCLAW_TOKEN;
+      }
+    });
+
+    check("vault miss degrades to the legacy file with exactly one warning", () => {
+      fs.rmSync(path.join(root, "accounts"), { recursive: true, force: true });
+      const log = spyLog();
+      const layer = createTokenLayer(cfg, log);
+      assert.equal(layer.getToken(), "Bearer legacy-jwt");
+      assert.equal(log.msgs.filter((m) => String(m).includes("vault")).length, 1);
+      writeEncryptedVault(root, "acct-1", KEYRING_PASSWORD, { accessToken: "Bearer vault-jwt" });
+    });
+
+    check("neither source → the legacy error message, still thrown", () => {
+      fs.rmSync(path.join(root, "accounts"), { recursive: true, force: true });
+      fs.rmSync(legacyFile, { force: true });
+      const layer = createTokenLayer(cfg, spyLog());
+      assert.throws(() => layer.getToken(), /Cannot read AutoClaw token/);
+      writeEncryptedVault(root, "acct-1", KEYRING_PASSWORD, { accessToken: "Bearer vault-jwt" });
+      writeLegacyHeaders(legacyFile, "Bearer legacy-jwt");
+    });
+
+    check("expired vault token is treated as missing, not cached", () => {
+      const now = Math.floor(Date.now() / 1000);
+      fs.rmSync(path.join(root, "accounts"), { recursive: true, force: true });
+      fs.rmSync(legacyFile, { force: true });
+      writeEncryptedVault(root, "acct-exp", KEYRING_PASSWORD, { accessToken: "Bearer expired-jwt" }, now);
+      const layer = createTokenLayer(cfg, spyLog());
+      // no legacy file either, so the expired vault is a double-miss and throws
+      assert.throws(() => layer.getToken(), /Cannot read AutoClaw token/);
+      // rotate to a valid token; the layer must see it on the very next call
+      fs.rmSync(path.join(root, "accounts"), { recursive: true, force: true });
+      writeEncryptedVault(root, "acct-fresh", KEYRING_PASSWORD, { accessToken: "Bearer fresh-jwt" }, now + 60);
+      assert.equal(layer.getToken(), "Bearer fresh-jwt");
+      writeLegacyHeaders(legacyFile, "Bearer legacy-jwt");
+    });
+
+    check("invalidateToken still forces a re-resolve after rotation", () => {
+      const layer = createTokenLayer(cfg, spyLog());
+      const first = layer.getToken();
+      layer.invalidateToken();
+      assert.equal(layer.getToken(), first);
+    });
+  } finally {
+    if (prevDir === undefined) delete process.env.AUTOCLAW_CONFIG_DIR;
+    else process.env.AUTOCLAW_CONFIG_DIR = prevDir;
+    if (prevPw === undefined) delete process.env.GLMP_KEYRING_PASSWORD;
+    else process.env.GLMP_KEYRING_PASSWORD = prevPw;
+    if (prevDirect === undefined) delete process.env.GLMP_AUTOCLAW_TOKEN;
+    else process.env.GLMP_AUTOCLAW_TOKEN = prevDirect;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 }
 
 summary();
