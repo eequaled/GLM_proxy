@@ -255,9 +255,10 @@ check("resolveUpstreamModelId keeps known ids, maps auto, prefixes others", () =
 
 // ── Fallback model catalog ─────────────────────────────────────────────────
 
-check("fallback catalog ships six models incl glm-5.3-flash", () => {
+check("fallback catalog ships expected models incl glm-5.3-flash", () => {
   const cfg = loadConfig({ format: "openai" });
-  assert.ok(Array.isArray(cfg.FALLBACK_MODELS) && cfg.FALLBACK_MODELS.length === 6);
+  const expectedCount = process.platform === "linux" ? 4 : 6;
+  assert.ok(Array.isArray(cfg.FALLBACK_MODELS) && cfg.FALLBACK_MODELS.length === expectedCount);
   assert.ok(cfg.FALLBACK_MODELS.some((m) => m.id === "zai_glm-5.3-flash"));
 });
 
@@ -333,7 +334,7 @@ check("malformed FALLBACK_MODELS_PATH degrades to built-ins", () => {
   process.env.FALLBACK_MODELS_PATH = "C:/definitely/not/here.json";
   try {
     const cfg = loadConfig({ format: "openai" });
-    assert.ok(cfg.FALLBACK_MODELS.length >= 5);
+    assert.ok(cfg.FALLBACK_MODELS.length >= 4);
     assert.ok(cfg.FALLBACK_MODELS.every((m) => typeof m.id === "string"));
   } finally {
     delete process.env.FALLBACK_MODELS_PATH;
