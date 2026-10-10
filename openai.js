@@ -36,6 +36,7 @@ import {
   getPacingGovernor, classifyGovernorError,
   startConfigHeartbeat, startShapeWatch,
 } from "./lib/core.js";
+import { globalInFlightQueue } from "./lib/queue.js";
 
 // Config
 const config = loadConfig({ format: "openai" });
@@ -250,11 +251,29 @@ async function handleChatCompletions(req, res) {
   // rejected this request before fallback ran; consumed by record() so the
   // terminal ring entry carries the full story.
   let cloudEvidence = null;
+  let releaseLock = null;
+  let released = false;
+  const releaseOnce = () => {
+    if (!released) {
+      released = true;
+      if (typeof releaseLock === "function") {
+        releaseLock();
+        releaseLock = null;
+      }
+    }
+  };
 
   // Terminal success handling shared by first-attempt and retried responses.
   async function respondSuccess(successRes) {
     record(successRes.statusCode, { model: modelId, lastMessage: lastMsgForLog(), messageCount: body.messages?.length || 0 });
     log.debug(`← upstream status=${successRes.statusCode}`);
+
+    res.on("close", () => {
+      if (!res.writableFinished && successRes && !successRes.destroyed) {
+        try { successRes.destroy(); } catch (_) {}
+      }
+      releaseOnce();
+    });
 
     if (stream) {
       res.writeHead(200, SSE_HEADERS);
@@ -265,7 +284,10 @@ async function handleChatCompletions(req, res) {
       successRes.on("error", (err) => {
         log.warn(`Upstream stream failed mid-response: ${err.message}`);
         try { res.end(); } catch (_) {}
+        releaseOnce();
       });
+      successRes.on("end", releaseOnce);
+      successRes.on("close", releaseOnce);
       successRes.pipe(res);
       return;
     }
@@ -282,6 +304,8 @@ async function handleChatCompletions(req, res) {
     } catch (err) {
       if (!res.headersSent) sendErrorOpenAI(res, err.message, "api_error", 502, "upstream_parse_failed");
       else { try { res.end(); } catch (_) {} }
+    } finally {
+      releaseOnce();
     }
   }
 
@@ -307,6 +331,9 @@ async function handleChatCompletions(req, res) {
       return sendClassifiedErrorOpenAI(res, cls);
     }
 
+    // Upstream limits accounts to 1 concurrent active generation; serialize in-flight requests
+    releaseLock = await globalInFlightQueue.acquire();
+
     // Cloud call with one retry on the flaky 400 "invalid request" hiccup;
     // every >=400 body is buffered + logged (R1). Shared with anthropic.js.
     const { res: upstreamRes, errBody: upstreamErrBody } = await callUpstreamWithInvalidRequestRetry(
@@ -325,6 +352,8 @@ async function handleChatCompletions(req, res) {
     });
 
     if (effectiveStatus < 400) return respondSuccess(upstreamRes);
+
+    releaseOnce();
 
     // Rotate-out token caches BEFORE deciding fallback so the very next
     // request picks up the fresh JWT regardless of who serves this one.
@@ -355,6 +384,7 @@ async function handleChatCompletions(req, res) {
     });
     return sendClassifiedErrorOpenAI(res, cls);
   } catch (err) {
+    releaseOnce();
     // Transport-level failure (no HTTP response at all): dead token, connect
     // reset, upstream timeout…
     const cls = classifyTransportError(err);

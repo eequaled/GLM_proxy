@@ -33,6 +33,7 @@ import {
   getPacingGovernor, classifyGovernorError,
   startConfigHeartbeat, startShapeWatch,
 } from "./lib/core.js";
+import { globalInFlightQueue } from "./lib/queue.js";
 
 // Config (per-format log filenames come from `format`)
 const config = loadConfig({ format: "anthropic" });
@@ -138,7 +139,9 @@ function anthropicToOpenAI(body, modelId) {
   if (body.system) {
     const text = typeof body.system === "string"
       ? body.system
-      : body.system.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+      : (Array.isArray(body.system)
+          ? body.system.map((b) => typeof b === "string" ? b : (b.type === "text" ? b.text : (b.text || ""))).filter(Boolean).join("\n")
+          : "");
     if (text) messages.push({ role: "system", content: text });
   }
 
@@ -545,6 +548,19 @@ async function handleMessages(req, res) {
 
   const lastMsgForLog = () => lastMessagePreview(openAIBody.messages);
 
+  let cloudEvidence = null;
+  let releaseLock = null;
+  let released = false;
+  const releaseOnce = () => {
+    if (!released) {
+      released = true;
+      if (typeof releaseLock === "function") {
+        releaseLock();
+        releaseLock = null;
+      }
+    }
+  };
+
   try {
     const cachedFailure = permanentFailures.get(modelId);
     if (cachedFailure) {
@@ -563,6 +579,9 @@ async function handleMessages(req, res) {
       record(cls.status, { lastMessage: lastMsgForLog(), messageCount: openAIBody.messages?.length || 0, error: cls.code });
       return sendClassifiedErrorAnthropic(res, cls);
     }
+
+    // Upstream limits accounts to 1 concurrent active generation; serialize in-flight requests
+    releaseLock = await globalInFlightQueue.acquire();
 
     // Cloud call with one retry on the flaky 400 "invalid request" hiccup;
     // every >=400 body is buffered + logged (R1). Shared with openai.js.
@@ -586,13 +605,14 @@ async function handleMessages(req, res) {
 
     // Failure path only — a 2xx falls through to the success renderer below.
     if (statusCode >= 400) {
+      releaseOnce();
       // Classify the verdict the client will see. The classified status is
       // what goes on the wire: a raw 403 meaning "free-tier capacity throttle"
       // (810002) becomes 429 upstream_busy, so a harness backs off instead of
       // retrying into a wall.
       const cls = classifyUpstreamError(statusCode, upstreamErrBody, modelId);
       if (cls.permanent) permanentFailures.mark(modelId, cls);
-      log.error(`Upstream error ${statusCode}:`, cls.message);
+      log.error(`Upstream error ${statusCode}:`, cls.message, upstreamErrBody ? `Body: ${upstreamErrBody.slice(0, 500)}` : "(empty body)");
       cloudEvidence = { status: statusCode, code: cls.code };
 
       record(cls.status, {
@@ -606,6 +626,13 @@ async function handleMessages(req, res) {
 
     // Success paths
     record(statusCode, { lastMessage: lastMsgForLog(), messageCount: openAIBody.messages?.length || 0 });
+
+    res.on("close", () => {
+      if (!res.writableFinished && upstreamRes && !upstreamRes.destroyed) {
+        try { upstreamRes.destroy(); } catch (_) {}
+      }
+      releaseOnce();
+    });
 
     if (stream) {
       res.writeHead(200, SSE_HEADERS);
@@ -643,9 +670,14 @@ async function handleMessages(req, res) {
         }
         for (const e of openAIChunkToAnthropicEvents("data: [DONE]", state)) res.write(e);
         res.end();
+        releaseOnce();
       });
 
-      upstreamRes.on("error", (err) => { log.error("Stream error:", err); res.end(); });
+      upstreamRes.on("error", (err) => {
+        log.error("Stream error:", err);
+        try { res.end(); } catch (_) {}
+        releaseOnce();
+      });
       return;
     }
 
@@ -659,9 +691,21 @@ async function handleMessages(req, res) {
       } catch (err) {
         if (!res.headersSent) sendErrorAnthropic(res, `Failed to parse upstream response: ${err.message}`, "api_error", 502, "upstream_parse_failed");
         else { try { res.end(); } catch (_) {} }
+      } finally {
+        releaseOnce();
       }
     });
+    upstreamRes.on("error", (err) => {
+      log.error("Non-stream upstream error:", err);
+      if (!res.headersSent) {
+        sendErrorAnthropic(res, `Upstream stream failed: ${err.message}`, "api_error", 502, "upstream_failed");
+      } else {
+        try { res.end(); } catch (_) {}
+      }
+      releaseOnce();
+    });
   } catch (err) {
+    releaseOnce();
     const cls = classifyTransportError(err);
     log.error(`messages model=${body.model} transport failure:`, cls.message);
     if (res.headersSent) { try { res.end(); } catch (_) {} return; }
