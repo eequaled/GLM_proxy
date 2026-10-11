@@ -276,4 +276,57 @@ const ask = () => post(PORT, {
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+// ---- 6. the TLS bridge sidecar is gone, and that is deliberate --------------
+//
+// The linux support work briefly shipped a python3/curl_cffi sidecar that
+// impersonated Chrome's TLS fingerprint on the autoglm host, gated behind
+// GLMP_USE_BRIDGE / GLMP_FORCE_BRIDGE. The 406 that motivated it was the
+// application layer — the 1.x harness header and the 1.x banner on the 2.x
+// upstream — and the live 200s after that fix disproved the TLS theory. The
+// sidecar is deleted; the native h1 transport serves every host. The two
+// variables state their removal once at startup, exactly like PREFER_LOCAL.
+{
+  const home = makeHome();
+  const { mock, proxy } = await againstMock({}, home, { GLMP_USE_BRIDGE: "1" });
+
+  const res = await ask();
+  const out = proxyOutput(proxy).all || "";
+
+  check("bridge-removed: GLMP_USE_BRIDGE=1 still serves from the native path",
+    res.status === 200 && mock.getRequests().length === 1,
+    `${res.status} hits=${mock.getRequests().length}`);
+
+  check("bridge-removed: the removal is stated once at startup, not per request",
+    (out.match(/GLMP_USE_BRIDGE/g) || []).length === 1 && /removed/i.test(out),
+    out.split("\n").filter((l) => /bridge/i.test(l)).join(" | "));
+
+  await stopProxy(proxy);
+  await mock.close();
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+{
+  const home = makeHome();
+  const { mock, proxy } = await againstMock({}, home, { GLMP_USE_BRIDGE: "1", GLMP_FORCE_BRIDGE: "1" });
+
+  const res = await ask();
+  const out = proxyOutput(proxy).all || "";
+
+  check("bridge-removed: the full bridge configuration still serves from the native path",
+    res.status === 200 && mock.getRequests().length === 1,
+    `${res.status} hits=${mock.getRequests().length}`);
+
+  check("bridge-removed: and the removal is stated for the force configuration too",
+    /GLMP_USE_BRIDGE/.test(out) && /removed/i.test(out),
+    out.split("\n").filter((l) => /bridge/i.test(l)).join(" | "));
+
+  check("bridge-removed: the old bridge path never engages (no fallback vocabulary)",
+    !/bridge unavailable|falling back to standard transport|Failed to start TLS bridge/i.test(out),
+    out.split("\n").filter((l) => /bridge/i.test(l)).join(" | "));
+
+  await stopProxy(proxy);
+  await mock.close();
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 summary();
