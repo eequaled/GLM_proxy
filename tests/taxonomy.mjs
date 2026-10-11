@@ -312,21 +312,62 @@ check("fallback catalog ships expected models incl glm-5.3-flash", () => {
 // The harness declaration the upstream's prompt allowlist accepts, and the switch
 // that turns it off. Measured from the app bundle; probe-verified against the
 // live upstream (tests/experiments/harness-type-probe.mjs).
+//
+// Both checks pin the generation explicitly. They used to read the ambient
+// config, which on a machine with a 2.x install means IS_AUTOCLAW2=true — so they
+// were only ever asserting the 1.x contract because CLIENT_HEADERS carried the
+// header unconditionally, which is precisely the leak that made every Linux
+// request 406. Pinning GLMP_AUTOCLAW2=0 states the contract instead of depending
+// on where the suite happens to run.
+function withEnv(vars, fn) {
+  const prev = {};
+  for (const [k, v] of Object.entries(vars)) {
+    prev[k] = process.env[k];
+    if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+  try { return fn(); } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+}
+
 check("client headers declare the harness the app declares", () => {
-  const cfg = loadConfig({ format: "openai" });
+  const cfg = withEnv({ GLMP_AUTOCLAW2: "0" }, () => loadConfig({ format: "openai" }));
   assert.equal(cfg.CLIENT_HEADERS["X-Harness-Type"], "zcode");
   assert.equal(cfg.CLIENT_HEADERS.x_trace_id, "autoclaw-desktop");
 });
 
 check("GLMP_HARNESS_TYPE= (empty) sends no harness declaration at all", () => {
-  const prev = process.env.GLMP_HARNESS_TYPE;
-  process.env.GLMP_HARNESS_TYPE = "";
+  const cfg = withEnv({ GLMP_AUTOCLAW2: "0", GLMP_HARNESS_TYPE: "" }, () => loadConfig({ format: "openai" }));
+  assert.equal(cfg.CLIENT_HEADERS["X-Harness-Type"], undefined);
+  assert.equal(cfg.CLIENT_HEADERS.x_trace_id, undefined);
+});
+
+// The 1.x exemption is not merely useless on 2.x, it is the 406. Measured on the
+// live upstream 2026-10-11 over the captured 2.x header set: sending
+// `X-Harness-Type: zcode` gets an empty-bodied 406 that never reaches the
+// application, and removing it from an otherwise identical request streams 200.
+// The 2.x bundle contains that header name zero times, so the app it impersonates
+// never sends it. Both halves are asserted: the header is gone AND the env knob
+// cannot put it back, because the exclusion is scoped to the generation rather
+// than left to the operator (or to a later call site) to remember.
+check("2.x sends no harness declaration, and GLMP_HARNESS_TYPE cannot force one back in", () => {
+  const prev2 = process.env.GLMP_AUTOCLAW2;
+  const prevH = process.env.GLMP_HARNESS_TYPE;
+  process.env.GLMP_AUTOCLAW2 = "1";
+  process.env.GLMP_HARNESS_TYPE = "zcode";
   try {
     const cfg = loadConfig({ format: "openai" });
+    assert.equal(cfg.IS_AUTOCLAW2, true);
     assert.equal(cfg.CLIENT_HEADERS["X-Harness-Type"], undefined);
-    assert.equal(cfg.CLIENT_HEADERS.x_trace_id, undefined);
+    // The trace id rides on both generations and is measured harmless on 2.x.
+    assert.equal(cfg.CLIENT_HEADERS.x_trace_id, "autoclaw-desktop");
+    assert.equal(cfg.CLIENT_HEADERS["X-Version"], "2.0.3");
+    assert.equal(cfg.CLIENT_HEADERS["X-Tm"], process.platform === "win32" ? "win" : "linux");
   } finally {
-    if (prev === undefined) delete process.env.GLMP_HARNESS_TYPE; else process.env.GLMP_HARNESS_TYPE = prev;
+    if (prev2 === undefined) delete process.env.GLMP_AUTOCLAW2; else process.env.GLMP_AUTOCLAW2 = prev2;
+    if (prevH === undefined) delete process.env.GLMP_HARNESS_TYPE; else process.env.GLMP_HARNESS_TYPE = prevH;
   }
 });
 

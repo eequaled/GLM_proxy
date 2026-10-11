@@ -14,7 +14,7 @@ import { check, summary, startProxy, stopProxy, proxyOutput } from "./_helpers.m
 import { PEN_TEST_PORTS } from "../lib/constants.js";
 import { loadConfig, getShapeLayer } from "../lib/core.js";
 import { createIdentityLayer, IDENTITY_SNAPSHOT_FILE } from "../lib/identity.js";
-import { BANNER_SNAPSHOT_FILE, COMPACTION_MARKER, PINNED_BANNER, extractBannerFrom } from "../lib/shape.js";
+import { BANNER_SNAPSHOT_FILE, COMPACTION_MARKER, PINNED_BANNER, PINNED_BANNER_2X, BANNER_ANCHOR_2X, extractBannerFrom } from "../lib/shape.js";
 
 const RUNTIME_NAME = "openclaw.runtime.json";
 
@@ -374,6 +374,51 @@ check("shape: a file without the anchor yields no banner instead of a guess",
         layer.getBanner().source);
       check("shape: running on the pin is announced, not silent",
         cap.warns.some((w) => /pinned system-prompt banner/.test(w)), cap.warns.join(" | "));
+    });
+  });
+}
+
+// The 2.x banner: on IS_AUTOCLAW2 the proxy sends the app's own opening sentence
+// instead of the 1.x OpenClaw literal. This is the gate literal the upstream
+// allowlist matches on — the 1.x string occurs zero times in the 2.x bundle.
+{
+  const home = makeHome();
+  await withHome(home, async () => {
+    await withEnv({ ...NO_INSTALL(home), GLMP_AUTOCLAW2: "1" }, async () => {
+      const config = loadConfig({ format: "openai" });
+      const cap = captureLog();
+      const layer = getShapeLayer(config, cap.log);
+      const banner = layer.getBanner();
+      check("shape: 2.x resolves to pinned-2x source, not the 1.x pin",
+        banner.source === "pinned-2x", banner.source);
+      check("shape: 2.x banner IS the app's own opening sentence",
+        banner.text === PINNED_BANNER_2X && banner.text.includes(BANNER_ANCHOR_2X),
+        JSON.stringify(banner.text));
+      check("shape: 2.x banner differs from the 1.x pin",
+        banner.text !== PINNED_BANNER, "they match but should not");
+      // Injection: the 2.x banner is what a bannerless request gets.
+      const injected = layer.injectBanner([{ role: "user", content: "hi" }]);
+      check("shape: 2.x injection prepends the 2.x banner",
+        injected[0].role === "system" && injected[0].content === PINNED_BANNER_2X,
+        JSON.stringify(injected[0].content?.slice(0, 80)));
+      // No pinned-warning for 2.x — the banner there is *correct*, not a guess.
+      check("shape: 2.x does not log the 1.x pinned warning",
+        !cap.warns.some((w) => /pinned system-prompt banner/.test(w)),
+        cap.warns.join(" | "));
+    });
+  });
+}
+
+// Env override still outranks the 2.x pin, exactly as it does on 1.x.
+{
+  const home = makeHome();
+  await withHome(home, async () => {
+    await withEnv({ ...NO_INSTALL(home), GLMP_AUTOCLAW2: "1", AUTOCLAW_SYSTEM_BANNER: "OVERRIDE-2X" }, async () => {
+      const config = loadConfig({ format: "openai" });
+      const layer = getShapeLayer(config, captureLog().log);
+      check("shape: AUTOCLAW_SYSTEM_BANNER overrides even the 2.x pin",
+        layer.getBanner().source === "override" && layer.getBanner().text === "OVERRIDE-2X",
+        JSON.stringify(layer.getBanner()));
     });
   });
 }
