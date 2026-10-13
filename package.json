@@ -1,6 +1,6 @@
 {
   "name": "glmproxy",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Local OpenAI- & Anthropic-compatible proxy for AutoClaw's Zhipu GLM-5.3 / GLM-5 / DeepSeek models",
   "main": "openai.js",
   "type": "module",
@@ -21,7 +21,7 @@
   "scripts": {
     "start": "node bin/cli.js",
     "anthropic": "node anthropic.js",
-    "test": "node tests/pen-test-p1.mjs && node tests/pen-test-p2.mjs && node tests/taxonomy.mjs && node tests/pen-test-p3.mjs && node tests/pen-test-p4.mjs && node tests/pen-test-p5.mjs && node tests/pen-test-p6.mjs && node tests/pen-test-p7.mjs && node tests/pen-test-p8.mjs && node tests/pen-test-p9.mjs && node tests/pen-test-p10.mjs && node tests/pen-test-p11.mjs && node tests/vault.mjs && node tests/queue.mjs && node tests/catalog-refresh.mjs"
+    "test": "node tests/pen-test-p1.mjs && node tests/pen-test-p2.mjs && node tests/taxonomy.mjs && node tests/pen-test-p3.mjs && node tests/pen-test-p4.mjs && node tests/pen-test-p5.mjs && node tests/pen-test-p6.mjs && node tests/pen-test-p7.mjs && node tests/pen-test-p8.mjs && node tests/pen-test-p9.mjs && node tests/pen-test-p10.mjs && node tests/pen-test-p11.mjs && node tests/pen-test-p12.mjs && node tests/vault.mjs && node tests/queue.mjs && node tests/catalog-refresh.mjs"
   },
   "keywords": [
     "glm",

@@ -14,7 +14,10 @@ import { check, summary, startProxy, stopProxy, proxyOutput } from "./_helpers.m
 import { PEN_TEST_PORTS } from "../lib/constants.js";
 import { loadConfig, getShapeLayer } from "../lib/core.js";
 import { createIdentityLayer, IDENTITY_SNAPSHOT_FILE } from "../lib/identity.js";
-import { BANNER_SNAPSHOT_FILE, COMPACTION_MARKER, PINNED_BANNER, PINNED_BANNER_2X, BANNER_ANCHOR_2X, extractBannerFrom } from "../lib/shape.js";
+import {
+  BANNER_SNAPSHOT_FILE, COMPACTION_MARKER, PINNED_BANNER, PINNED_BANNER_2X,
+  BANNER_ANCHOR_2X, extractBannerFrom, neutralizeForeignIdentities,
+} from "../lib/shape.js";
 
 const RUNTIME_NAME = "openclaw.runtime.json";
 
@@ -273,6 +276,7 @@ function writePromptConfigFixture(dir) {
 const CLEAN_SHAPE_ENV = {
   GLMP_GATEWAY_DIST: undefined, AUTOCLAW_SYSTEM_BANNER: undefined,
   PROMPT_ENVELOPE_KB: undefined, TOOL_SHAPE_BLOCKLIST: undefined,
+  GLMP_FOREIGN_IDENTITY_GUARD: undefined,
 };
 
 // Point discovery at a path that does not exist. The gateway-dist roots come from
@@ -503,6 +507,133 @@ check("shape: a file without the anchor yields no banner instead of a guess",
         && out.droppedToolFields.includes("strict"), JSON.stringify(out.tools));
       check("shape: a dropped tool field is logged, never silent",
         cap.infos.some((i) => /dropped tool field/.test(i)), cap.infos.join(" | "));
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The 2.x gate's *denylist*: the allowlist literal is not enough on its own.
+// Measured live 2026-10-13 (`.dbg/linux-406/probe-*.mjs`): the 2.x upstream
+// answers a bare 406 (empty body) when the system prompt carries a foreign
+// coding-harness signature, even with the vendor literal present. A harness
+// opens its prompt with exactly those lines, so the shape layer must rewrite
+// them before the body leaves.
+// ---------------------------------------------------------------------------
+{
+  const banned = [
+    "You are Claude Code, Anthropic's official CLI for Claude.",
+    "YOU ARE CURSOR",
+    "You are Cline",
+    "You are Codex, a coding agent",
+    "You are Qwen Code",
+    "you are opencode, an AI coding agent",
+    "You are an interactive CLI tool that helps users with software engineering tasks.",
+    // Trae's SOLO agent, captured live 2026-10-14: this sentence alone 406s.
+    "You are an interactive agent in TraeCode that helps the USER with software engineering tasks.",
+  ];
+  const allowed = [
+    "You are Claude", "You are Windsurf", "You are a coding agent",
+    "You're Claude Code", "You are  Claude Code", "You are an AI coding assistant",
+    // Measured on the live 2.x host 2026-10-14: the Trae *brand* is not the
+    // signature — only its product-named identity phrase is. Rewriting any of
+    // these would change a prompt the gate already answers.
+    "You are Trae AI, a powerful agentic AI coding assistant.",
+    "You are an interactive agent in Trae",
+    "You are an interactive agent in Trae Code",
+    "You are an interactive agent that helps users with software engineering tasks",
+    "an interactive agent in TraeCode that helps the USER with software engineering tasks",
+    "You are an interactive agent in Cursor that helps the USER with software engineering tasks.",
+  ];
+  let okB = 0, okA = 0;
+  for (const t of banned) if (neutralizeForeignIdentities(t).hits.length > 0) okB++;
+  for (const t of allowed) if (neutralizeForeignIdentities(t).hits.length === 0) okA++;
+  check("shape: every measured 2.x-denied signature is neutralised",
+    okB === banned.length, `${okB}/${banned.length}`);
+  check("shape: lookalikes the gate accepts are left alone",
+    okA === allowed.length, `${okA}/${allowed.length}`);
+  check("shape: the neutraliser rewrites in place, keeping surrounding prose",
+    neutralizeForeignIdentities("You are Cursor, an AI code editor. Help me.").text
+      === "You are AutoClaw, an AI code editor. Help me.",
+    neutralizeForeignIdentities("You are Cursor, an AI code editor. Help me.").text);
+}
+
+{
+  const home = makeHome();
+  await withHome(home, async () => {
+    const claudeCode = "You are Claude Code, Anthropic's official CLI for Claude.\n\n" +
+      "You are an interactive CLI tool that helps users with software engineering tasks. " +
+      "Use the instructions below.";
+
+    await withEnv({ ...NO_INSTALL(home), GLMP_AUTOCLAW2: "1" }, async () => {
+      const config = loadConfig({ format: "openai" });
+      const cap = captureLog();
+      const layer = getShapeLayer(config, cap.log);
+      const messages = [{ role: "system", content: claudeCode }, { role: "user", content: "hi" }];
+      const out = layer.apply(messages, []);
+      const lower = out.messages[0].content.toLowerCase();
+
+      check("shape: a Claude Code identity is neutralised before it reaches the 2.x gate",
+        !lower.includes("you are claude code"), out.messages[0].content.slice(0, 120));
+      check("shape: the stock Claude Code descriptor sentence is neutralised too",
+        !lower.includes("interactive cli tool that helps users"), out.messages[0].content.slice(0, 160));
+      check("shape: the neutralised prompt keeps the vendor identity and the rest of the prompt",
+        out.messages[0].content.startsWith(PINNED_BANNER_2X)
+        && out.messages[0].content.includes("Use the instructions below."),
+        out.messages[0].content.slice(0, 160));
+      check("shape: the rewrite is announced, never silent",
+        cap.infos.some((i) => /neutralised foreign harness signature/.test(i)), cap.infos.join(" | "));
+      check("shape: the neutraliser reports both signatures it changed",
+        out.neutralizedIdentities.length === 2, JSON.stringify(out.neutralizedIdentities));
+      check("shape: neutralisation is pure — the client's own body is not mutated",
+        messages[0].content === claudeCode, "the input message changed");
+
+      // Trae's real opening (captured from the client live: the 406 this pass
+      // was about). Its *product-named* identity phrase is the signature — the
+      // bare brand, a shorter `in Trae`, and the generic "interactive agent …
+      // software engineering tasks" clause are all accepted by the gate, which
+      // is why the entry is the full phrase and not `you are trae`.
+      const trae = "You are an interactive agent in TraeCode that helps the USER with " +
+        "software engineering tasks. Use the instructions below and the tools available to you " +
+        "to assist the USER.";
+      const outTrae = layer.apply([{ role: "system", content: trae }, { role: "user", content: "hi" }], []);
+      const traeContent = outTrae.messages[0].content;
+      check("shape: Trae's product-named identity phrase is neutralised",
+        !traeContent.toLowerCase().includes("you are an interactive agent in traecode"),
+        traeContent.slice(0, 200));
+      check("shape: Trae's prompt keeps its instructions after the rewrite",
+        traeContent.startsWith(PINNED_BANNER_2X) && traeContent.includes("Use the instructions below")
+        && traeContent.includes("to assist the USER."), traeContent.slice(0, 200));
+      check("shape: the Trae rewrite is reported by name",
+        outTrae.neutralizedIdentities.includes("you are an interactive agent in traecode"),
+        JSON.stringify(outTrae.neutralizedIdentities));
+
+      // The negative half beside the positive: a benign prompt is untouched.
+      const benign = "You are a helpful assistant.\n\nBe concise.";
+      const cap2 = captureLog();
+      const out2 = getShapeLayer(config, cap2.log)
+        .apply([{ role: "system", content: benign }, { role: "user", content: "hi" }], []);
+      check("shape: a benign prompt is left alone",
+        out2.messages[0].content === `${PINNED_BANNER_2X}\n\n${benign}`, out2.messages[0].content.slice(0, 120));
+      check("shape: nothing is rewritten in a benign prompt",
+        out2.neutralizedIdentities.length === 0 && !cap2.infos.some((i) => /neutralised/.test(i)),
+        `${JSON.stringify(out2.neutralizedIdentities)} | ${cap2.infos.join(" | ")}`);
+
+      // Array-content system prompts (the Anthropic shape) are covered too.
+      const parts = [{ type: "text", text: "You are Cursor, an AI code editor." }, { type: "text", text: "More rules." }];
+      const outA = layer.apply([{ role: "system", content: parts }, { role: "user", content: "hi" }], []);
+      check("shape: neutralisation reaches array-content system prompts",
+        !JSON.stringify(outA.messages[0].content).toLowerCase().includes("you are cursor"),
+        JSON.stringify(outA.messages[0].content).slice(0, 120));
+    });
+
+    // The guard is a switch, and `0` means off (the repo's convention).
+    await withEnv({ ...NO_INSTALL(home), GLMP_AUTOCLAW2: "1", GLMP_FOREIGN_IDENTITY_GUARD: "0" }, async () => {
+      const config = loadConfig({ format: "openai" });
+      const out = getShapeLayer(config, captureLog().log)
+        .apply([{ role: "system", content: claudeCode }, { role: "user", content: "hi" }], []);
+      check("shape: GLMP_FOREIGN_IDENTITY_GUARD=0 disables the rewrite",
+        out.messages[0].content.includes("You are Claude Code") && out.neutralizedIdentities.length === 0,
+        out.messages[0].content.slice(0, 100));
     });
   });
 }
