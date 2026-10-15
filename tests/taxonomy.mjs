@@ -261,7 +261,7 @@ check("tier targets follow degradation rules (heuristic-only catalog)", () => {
   assert.equal(t.default, t.sonnet);
 });
 
-check("with remote tiers, haiku picks non-auto Low", () => {
+check("with remote tiers, haiku picks the auto Low", () => {
   const remote = [
     { id: "zai_auto", creditConsumptionLevel: "Low" },
     { id: "zaicoding_glm-5.3", creditConsumptionLevel: "High" },
@@ -271,12 +271,20 @@ check("with remote tiers, haiku picks non-auto Low", () => {
   const t = resolveTierTargets(annotateCreditTiers(LIVE_CATALOG, remote));
   assert.equal(t.opus, "zaicoding_glm-5.3");
   assert.equal(t.sonnet, "zai_glm-5-turbo");
-  assert.equal(t.haiku, "tdpsk_deepseek-v4-flash-202605");
+  assert.equal(t.haiku, "zai_auto");
 });
 
-check("haiku prefers a non-auto model inside its tier", () => {
+check("haiku prefers the auto model inside its tier", () => {
   const t = resolveTierTargets([
     { id: "zai_auto", name: "Auto", creditLevel: "Low" },
+    { id: "other_low", name: "OtherLow", creditLevel: "Low" },
+    { id: "mid_model", name: "Mid", creditLevel: "Medium" },
+  ]);
+  assert.equal(t.haiku, "zai_auto");
+});
+
+check("haiku falls back to a non-auto Low when no auto candidate exists", () => {
+  const t = resolveTierTargets([
     { id: "other_low", name: "OtherLow", creditLevel: "Low" },
     { id: "mid_model", name: "Mid", creditLevel: "Medium" },
   ]);

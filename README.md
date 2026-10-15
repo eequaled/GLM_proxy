@@ -204,7 +204,7 @@ The catalog is re-read dynamically from AutoClaw's runtime snapshot on every `/v
 |---|---|---|
 | `claude-opus-*` | `zaicoding_glm-5.3` | `zaicoding_glm-5.3` |
 | `claude-sonnet-*` | `zaicoding_glm-5.3` / `zai_auto` | `zaicoding_glm-5.3` / `zai_auto` |
-| `claude-haiku-*` | `zai_glm-5.3-flash` | `zai_glm-5.3-flash` / `zai_glm-5-turbo` |
+| `claude-haiku-*` | `zai_auto` | `zai_auto` |
 
 ---
 
