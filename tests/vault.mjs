@@ -15,6 +15,8 @@ import {
   parseJwtPayload,
   isJwtExpired,
   decryptCredentials,
+  decryptWindowsCredentials,
+  getWindowsOsCryptKey,
   extractAutoClawVaultToken,
 } from "../lib/vault.js";
 import { createTokenLayer } from "../lib/core.js";
@@ -62,6 +64,18 @@ function encryptV11(plaintextObj, password, prefix = "v11") {
     cipher.final(),
   ]);
   return Buffer.concat([Buffer.from(prefix, "utf8"), body]);
+}
+
+// What Windows Electron `safeStorage` writes: v10 + 12-byte nonce + AES-256-GCM
+// ciphertext + 16-byte tag, keyed by the 32-byte DPAPI-unprotected OSCrypt key.
+function encryptV10Gcm(plaintextObj, key) {
+  const nonce = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, nonce);
+  const body = Buffer.concat([
+    cipher.update(Buffer.from(JSON.stringify(plaintextObj), "utf8")),
+    cipher.final(),
+  ]);
+  return Buffer.concat([Buffer.from("v10", "utf8"), nonce, body, cipher.getAuthTag()]);
 }
 
 // ── Discovery ────────────────────────────────────────────────────────────────
@@ -182,14 +196,36 @@ function encryptV11(plaintextObj, password, prefix = "v11") {
 {
   const prev = process.env.AUTOCLAW_CONFIG_DIR;
   const prevXdg = process.env.XDG_CONFIG_HOME;
+  const prevAppRoot = process.env.AUTOCLAW_USER_DATA_ROOT;
   delete process.env.AUTOCLAW_CONFIG_DIR;
   delete process.env.XDG_CONFIG_HOME;
+  delete process.env.AUTOCLAW_USER_DATA_ROOT;
   try {
-    check("default roots are the observed AutoClaw root plus the reported one", () => {
+    check("default roots match the host platform (observed root first)", () => {
       const dirs = getAutoClawConfigDirs();
       assert.equal(dirs.length, 2);
-      assert.equal(dirs[0], path.join(os.homedir(), ".config", "AutoClaw"));
-      assert.equal(dirs[1], path.join(os.homedir(), ".config", "AutoClaw-oversea-official"));
+      if (process.platform === "win32") {
+        const appData = path.join(os.homedir(), "AppData", "Roaming");
+        assert.equal(dirs[0], path.join(appData, "AutoClaw-oversea-official"));
+        assert.equal(dirs[1], path.join(appData, "AutoClaw"));
+      } else {
+        assert.equal(dirs[0], path.join(os.homedir(), ".config", "AutoClaw"));
+        assert.equal(dirs[1], path.join(os.homedir(), ".config", "AutoClaw-oversea-official"));
+      }
+    });
+    check("win32 derives Electron userData roots from the home dir", () => {
+      const dirs = getAutoClawConfigDirs({}, "win32", path.join("C:", "Users", "x"));
+      assert.deepEqual(dirs, [
+        path.join("C:", "Users", "x", "AppData", "Roaming", "AutoClaw-oversea-official"),
+        path.join("C:", "Users", "x", "AppData", "Roaming", "AutoClaw"),
+      ]);
+    });
+    check("non-win32 derives the Linux config roots", () => {
+      const dirs = getAutoClawConfigDirs({}, "linux", path.join("/home", "x"));
+      assert.deepEqual(dirs, [
+        path.join("/home", "x", ".config", "AutoClaw"),
+        path.join("/home", "x", ".config", "AutoClaw-oversea-official"),
+      ]);
     });
     check("default discovery returns an array without throwing", () => {
       assert.ok(Array.isArray(findAutoClawVaults()));
@@ -200,6 +236,8 @@ function encryptV11(plaintextObj, password, prefix = "v11") {
     else process.env.AUTOCLAW_CONFIG_DIR = prev;
     if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = prevXdg;
+    if (prevAppRoot === undefined) delete process.env.AUTOCLAW_USER_DATA_ROOT;
+    else process.env.AUTOCLAW_USER_DATA_ROOT = prevAppRoot;
   }
 }
 
@@ -264,6 +302,38 @@ check("isJwtExpired treats a non-jwt or exp-less token as unexpired", () => {
   check("missing password is refused before any decryption", () => {
     assert.throws(() => decryptCredentials(enc, null));
     assert.throws(() => decryptCredentials(enc, ""));
+  });
+}
+
+// ── Windows decryption (v10 AES-256-GCM) ─────────────────────────────────────
+
+{
+  const key = crypto.randomBytes(32);
+  const plaintext = { schemaVersion: 1, accessToken: "Bearer win-secret-token", refreshToken: "win-refresh" };
+  const enc = encryptV10Gcm(plaintext, key);
+
+  check("windows v10 GCM payload round-trips to the accessToken", () => {
+    const creds = decryptWindowsCredentials(enc, key);
+    assert.equal(creds.accessToken, "Bearer win-secret-token");
+    assert.equal(creds.refreshToken, "win-refresh");
+  });
+
+  check("a wrong windows key fails authentication instead of returning junk", () => {
+    assert.throws(() => decryptWindowsCredentials(enc, crypto.randomBytes(32)));
+  });
+
+  check("a non-v10 prefix is refused by the windows path with a named error", () => {
+    const bad = Buffer.concat([Buffer.from("v11", "utf8"), enc.subarray(3)]);
+    assert.throws(() => decryptWindowsCredentials(bad, key), /v11/);
+  });
+
+  check("a key of the wrong length is refused before decryption", () => {
+    assert.throws(() => decryptWindowsCredentials(enc, key.subarray(0, 16)));
+    assert.throws(() => decryptWindowsCredentials(enc, null));
+  });
+
+  check("a buffer too short to hold nonce+tag is refused", () => {
+    assert.throws(() => decryptWindowsCredentials(Buffer.from("v10short"), key));
   });
 }
 
@@ -336,6 +406,76 @@ const KEYRING_PASSWORD = "test-master-password";
     else process.env.AUTOCLAW_CONFIG_DIR = prevDir;
     if (prevPw === undefined) delete process.env.GLMP_KEYRING_PASSWORD;
     else process.env.GLMP_KEYRING_PASSWORD = prevPw;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// ── Windows extraction (DPAPI key env leg) ───────────────────────────────────
+
+function writeWindowsVault(root, accountId, key, plaintext, mtimeEpochSec = 1_000_000_000) {
+  const accountDir = path.join(root, "accounts", accountId);
+  fs.mkdirSync(accountDir, { recursive: true });
+  const encFile = path.join(accountDir, "account-credentials.enc");
+  fs.writeFileSync(encFile, encryptV10Gcm(plaintext, key));
+  const t = new Date(mtimeEpochSec * 1000);
+  fs.utimesSync(encFile, t, t);
+  fs.writeFileSync(path.join(accountDir, "account-profile.json"),
+    JSON.stringify({ profile: { displayName: `operator-${accountId}` } }));
+  return encFile;
+}
+
+{
+  const root = tmp("vault-windows-");
+  const prevDir = process.env.AUTOCLAW_CONFIG_DIR;
+  const prevPw = process.env.GLMP_KEYRING_PASSWORD;
+  const prevDp = process.env.GLMP_DPAPI_KEY;
+  const key = crypto.randomBytes(32);
+  process.env.AUTOCLAW_CONFIG_DIR = root;
+  delete process.env.GLMP_KEYRING_PASSWORD;
+  process.env.GLMP_DPAPI_KEY = key.toString("base64");
+  try {
+    writeWindowsVault(root, "win-acct", key, {
+      schemaVersion: 1,
+      accessToken: "Bearer win-vault-jwt",
+      refreshToken: "win-refresh",
+    });
+
+    check("GLMP_DPAPI_KEY unlocks a Windows v10 GCM vault and reports the account", () => {
+      const log = spyLog();
+      const res = extractAutoClawVaultToken({}, log);
+      assert.equal(res.token, "Bearer win-vault-jwt");
+      assert.equal(res.profile.displayName, "operator-win-acct");
+      assert.ok(log.msgs.some((m) => String(m).includes("operator-win-acct")));
+    });
+
+    check("a wrong DPAPI key degrades to null with one warning, never throws", () => {
+      process.env.GLMP_DPAPI_KEY = crypto.randomBytes(32).toString("base64");
+      const log = spyLog();
+      const res = extractAutoClawVaultToken({}, log);
+      assert.equal(res, null);
+      assert.equal(log.msgs.length, 1);
+      process.env.GLMP_DPAPI_KEY = key.toString("base64");
+    });
+
+    check("a malformed GLMP_DPAPI_KEY is warned about and never used", () => {
+      process.env.GLMP_DPAPI_KEY = "not-a-32-byte-key";
+      const log = spyLog();
+      const res = extractAutoClawVaultToken({}, log);
+      assert.equal(res, null);
+      assert.ok(log.msgs.some((m) => String(m).includes("GLMP_DPAPI_KEY")));
+      process.env.GLMP_DPAPI_KEY = key.toString("base64");
+    });
+
+    check("getWindowsOsCryptKey returns null without a config root, never throws", () => {
+      assert.equal(getWindowsOsCryptKey(null, spyLog()), null);
+    });
+  } finally {
+    if (prevDir === undefined) delete process.env.AUTOCLAW_CONFIG_DIR;
+    else process.env.AUTOCLAW_CONFIG_DIR = prevDir;
+    if (prevPw === undefined) delete process.env.GLMP_KEYRING_PASSWORD;
+    else process.env.GLMP_KEYRING_PASSWORD = prevPw;
+    if (prevDp === undefined) delete process.env.GLMP_DPAPI_KEY;
+    else process.env.GLMP_DPAPI_KEY = prevDp;
     fs.rmSync(root, { recursive: true, force: true });
   }
 }
