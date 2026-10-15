@@ -59,6 +59,12 @@ function fakeJwt(payloadObj) {
   return `${header}.${payload}.sig`;
 }
 
+// Chromium runs the OS master secret through PBKDF2 at 1 iteration on Linux and
+// 1003 on macOS, and the proxy reads that count from the host. Fixtures that must
+// survive a real resolve — the keyring-password cases below — therefore encrypt
+// with the host's count; the pure round-trip cases pass their count explicitly.
+const HOST_OSCRYPT_ITERATIONS = process.platform === "darwin" ? 1003 : 1;
+
 function encryptV11(plaintextObj, password, prefix = "v11", iterations = 1) {
   const key = crypto.pbkdf2Sync(password, "saltysalt", iterations, 16, "sha1");
   const iv = Buffer.alloc(16, 0x20);
@@ -407,7 +413,7 @@ function writeEncryptedVault(root, accountId, password, plaintext, mtimeEpochSec
   const accountDir = path.join(root, "accounts", accountId);
   fs.mkdirSync(accountDir, { recursive: true });
   const encFile = path.join(accountDir, "account-credentials.enc");
-  fs.writeFileSync(encFile, encryptV11(plaintext, password));
+  fs.writeFileSync(encFile, encryptV11(plaintext, password, "v11", HOST_OSCRYPT_ITERATIONS));
   const t = new Date(mtimeEpochSec * 1000);
   fs.utimesSync(encFile, t, t);
   fs.writeFileSync(path.join(accountDir, "account-profile.json"),

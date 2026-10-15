@@ -1,4 +1,8 @@
-// Pen-test p11 — the Linux credential chain, end to end (spec/linux-support Task 7).
+// Pen-test p11 — the keyring-password credential chain, end to end (spec/linux-support Task 7).
+//
+// Runs on Linux and macOS: both unlock the CBC vault from an operator-supplied
+// master secret, and the only difference between them is the KDF's iteration
+// count, which the fixture below takes from the host.
 //
 // What this suite is for
 // ----------------------
@@ -29,11 +33,17 @@ const VAULT_TOKEN = "Bearer p11-vault-token";
 const LEGACY_TOKEN = "Bearer p11-legacy-token";
 const DIRECT_TOKEN = "Bearer p11-direct-token";
 
-// The exact scheme Electron's safeStorage uses on Linux (Chromium OSCrypt v10):
-// PBKDF2 over the keyring password, AES-128-CBC with a 16×0x20 IV, and the
-// version prefix in front of the ciphertext.
+// The exact scheme Electron's safeStorage uses (Chromium OSCrypt v10): PBKDF2
+// over the OS master secret, AES-128-CBC with a 16×0x20 IV, and the version
+// prefix in front of the ciphertext. Linux and macOS share the cipher and the
+// salt and differ only in Chromium's iteration count (1 on Linux, 1003 on the
+// Keychain path), and the proxy picks that count from the host — so the fixture
+// has to as well, or a macOS run decrypts a Linux blob and dies with "bad
+// decrypt" while the proxy is behaving correctly.
+const OSCRYPT_ITERATIONS = process.platform === "darwin" ? 1003 : 1;
+
 function encryptV10(plaintextObj, password) {
-  const key = crypto.pbkdf2Sync(password, "saltysalt", 1, 16, "sha1");
+  const key = crypto.pbkdf2Sync(password, "saltysalt", OSCRYPT_ITERATIONS, 16, "sha1");
   const iv = Buffer.alloc(16, 0x20);
   const cipher = crypto.createCipheriv("aes-128-cbc", key, iv);
   const body = Buffer.concat([
