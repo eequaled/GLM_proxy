@@ -20,6 +20,7 @@ import {
   unmarshalValues,
   marshalMessage,
   parseMessage,
+  resolveBusAddress,
 } from "../lib/secretservice.js";
 
 const hex = (buf) => buf.toString("hex").replace(/(..)/g, "$1 ").trim();
@@ -237,6 +238,52 @@ const throws = (fn) => { try { fn(); return true; } catch { return true; } retur
 {
   const ok = throws(() => unmarshalValues("(oayays)", bytes("21 00 00 00 2f 6f 72 67")));
   check("unmarshal: truncated struct throws a named error instead of returning junk", ok);
+}
+
+// ── 13. resolveBusAddress — the env matrix (R2.8) ────────────────────────────
+//
+//   DBUS_SESSION_BUS_ADDRESS first (unix:path= / unix:abstract=, first usable
+//   of comma-separated candidates, tcp: skipped), then $XDG_RUNTIME_DIR/bus,
+//   then null. No further guessing.
+{
+  const check2 = (name, env, expected) => {
+    const got = resolveBusAddress(env);
+    const ok = expected === null
+      ? got === null
+      : got !== null && got.kind === expected.kind && got.target === expected.target;
+    check(name, ok, JSON.stringify(got));
+  };
+
+  check2("address: unix:path= wins", { DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus" },
+    { kind: "path", target: "/run/user/1000/bus" });
+
+  check2("address: unix:abstract= is recognized", { DBUS_SESSION_BUS_ADDRESS: "unix:abstract=/tmp/dbus-abc" },
+    { kind: "abstract", target: "/tmp/dbus-abc" });
+
+  check2("address: first usable candidate of a comma list",
+    { DBUS_SESSION_BUS_ADDRESS: "unix:abstract=/tmp/x,guid=deadbeef;unix:path=/run/user/1000/bus" },
+    { kind: "abstract", target: "/tmp/x" });
+
+  check2("address: tcp-only candidates are skipped in favour of unix",
+    { DBUS_SESSION_BUS_ADDRESS: "tcp:host=localhost,port=0,unix:path=/run/user/1000/bus" },
+    { kind: "path", target: "/run/user/1000/bus" });
+
+  check2("address: tcp-only env means no usable address (no guessing)",
+    { DBUS_SESSION_BUS_ADDRESS: "tcp:host=localhost,port=0" }, null);
+
+  check2("address: XDG_RUNTIME_DIR fallback when the env var is absent",
+    { DBUS_SESSION_BUS_ADDRESS: "", XDG_RUNTIME_DIR: "/run/user/1000" },
+    { kind: "path", target: "/run/user/1000/bus" });
+
+  check2("address: XDG_RUNTIME_DIR is ignored when the env var is set",
+    { DBUS_SESSION_BUS_ADDRESS: "unix:path=/custom/bus", XDG_RUNTIME_DIR: "/run/user/1000" },
+    { kind: "path", target: "/custom/bus" });
+
+  check2("address: neither knob yields null", {}, null);
+
+  check("address: the caller's env object is read, not process.env",
+    resolveBusAddress({ DBUS_SESSION_BUS_ADDRESS: "unix:path=/from/argument/bus" }).target === "/from/argument/bus",
+    JSON.stringify(resolveBusAddress({})));
 }
 
 summary();
