@@ -1,7 +1,10 @@
-// Offline tests for the Linux vault discovery + decrypt core (spec/linux-support Task 1).
+// Offline tests for the cross-platform vault discovery + decrypt core.
 // Hermetic: every discovery case points AUTOCLAW_CONFIG_DIR at a tmp fixture or
 // asserts only the override shape — no real HOME, keyring, or host vault is read.
+// The one live touch is the darwin-gated Keychain round-trip against a throwaway
+// item it creates and deletes itself; on other platforms it does not run.
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -17,6 +20,7 @@ import {
   decryptCredentials,
   decryptWindowsCredentials,
   getWindowsOsCryptKey,
+  getKeychainPassword,
   extractAutoClawVaultToken,
 } from "../lib/vault.js";
 import { createTokenLayer } from "../lib/core.js";
@@ -55,8 +59,8 @@ function fakeJwt(payloadObj) {
   return `${header}.${payload}.sig`;
 }
 
-function encryptV11(plaintextObj, password, prefix = "v11") {
-  const key = crypto.pbkdf2Sync(password, "saltysalt", 1, 16, "sha1");
+function encryptV11(plaintextObj, password, prefix = "v11", iterations = 1) {
+  const key = crypto.pbkdf2Sync(password, "saltysalt", iterations, 16, "sha1");
   const iv = Buffer.alloc(16, 0x20);
   const cipher = crypto.createCipheriv("aes-128-cbc", key, iv);
   const body = Buffer.concat([
@@ -335,6 +339,66 @@ check("isJwtExpired treats a non-jwt or exp-less token as unexpired", () => {
   check("a buffer too short to hold nonce+tag is refused", () => {
     assert.throws(() => decryptWindowsCredentials(Buffer.from("v10short"), key));
   });
+}
+
+// ── macOS leg ────────────────────────────────────────────────────────────────
+//
+// The macOS chain (Application Support roots → login Keychain → PBKDF2 at 1003
+// iterations) runs end-to-end only on a macOS runner; the root and parameter
+// halves are pure and run everywhere. The Keychain half is a real `security`
+// round-trip against a throwaway item, skipped off-darwin.
+
+{
+  const home = path.join(path.sep, "Users", "someone");
+
+  check("darwin derives Electron userData roots from the home dir", () => {
+    const dirs = getAutoClawConfigDirs({}, "darwin", home);
+    assert.deepEqual(dirs, [
+      path.join(home, "Library", "Application Support", "AutoClaw-oversea-official"),
+      path.join(home, "Library", "Application Support", "AutoClaw"),
+    ]);
+  });
+
+  const password = "mac-master-password";
+  const plaintext = { schemaVersion: 1, accessToken: "Bearer mac-secret-token" };
+
+  check("the macOS KDF round-trips at 1003 iterations", () => {
+    const enc = encryptV11(plaintext, password, "v10", 1003);
+    assert.equal(decryptCredentials(enc, password, 1003).accessToken, "Bearer mac-secret-token");
+  });
+
+  check("the Linux default does not accidentally open a macOS blob", () => {
+    const enc = encryptV11(plaintext, password, "v10", 1003);
+    assert.throws(() => decryptCredentials(enc, password));
+  });
+
+  check("zero, negative or fractional iteration counts are refused", () => {
+    const enc = encryptV11(plaintext, password, "v10", 1003);
+    assert.throws(() => decryptCredentials(enc, password, 0), /iteration/);
+    assert.throws(() => decryptCredentials(enc, password, -5), /iteration/);
+    assert.throws(() => decryptCredentials(enc, password, 1.5), /iteration/);
+  });
+}
+
+if (process.platform === "darwin") {
+  const service = `glmp-test-keychain-${process.pid}-${Date.now()}`;
+  const secret = `glmp-${crypto.randomBytes(8).toString("hex")}`;
+  try {
+    const added = spawnSync("security", [
+      "add-generic-password", "-s", service, "-a", "glmp-test", "-w", secret,
+    ], { encoding: "utf-8", timeout: 5000 });
+    if (added.status === 0) {
+      check("darwin: the Keychain probe reads back what `security` stored",
+        getKeychainPassword(null, [service]) === secret);
+      check("darwin: a Keychain item that does not exist is a clean null",
+        getKeychainPassword(null, [`${service}-absent`]) === null);
+    } else {
+      check("darwin: the Live Keychain probe could not run — `security` refused to add a test item "
+        + ((added.stderr || "").trim() || `exit ${added.status}`), false);
+    }
+  } finally {
+    spawnSync("security", ["delete-generic-password", "-s", service], { encoding: "utf-8", timeout: 5000 });
+  }
 }
 
 // ── Key chain + extraction ───────────────────────────────────────────────────
