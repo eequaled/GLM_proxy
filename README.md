@@ -14,7 +14,7 @@
   <img src="https://github.com/eequaled/GLM_proxy/actions/workflows/ci.yml/badge.svg" alt="CI">
 </p>
 
-<p align="center"><sub>v3.1.0. One CLI, two API formats, zero dependencies.</sub></p>
+<p align="center"><sub>v3.2.0. One CLI, two API formats, zero dependencies.</sub></p>
 
 ---
 
@@ -34,8 +34,8 @@ glmproxy --anthropic --port 3001 --key mykey
 Then point any OpenAI-compatible tool at `http://127.0.0.1:18791/v1`, or any Anthropic-compatible tool at `http://127.0.0.1:18792`. Default key is `mewmew` (see [Integrations](#integrations) below for exact per-tool setup).
 
 **You need:** [AutoClaw](https://autoclaw.z.ai) installed, running, and logged in:
-- **Windows / macOS**: AutoClaw 1.x reads the plaintext `request-headers.json`; AutoClaw 2.x (Electron) writes an encrypted vault and the proxy decrypts it via Windows DPAPI. Either way auth is automatic — no manual token copying.
-- **Linux**: AutoClaw 2.0.3 AppImage running. The proxy automatically discovers and syncs account tokens from the system Secret Service / GNOME Keyring vault with zero manual setup. For Linux TLS compatibility matching AutoClaw's Electron fingerprint, ensure `curl_cffi` is installed (`pip install curl_cffi`). Node.js 18+ required on all platforms.
+- **Windows / macOS / Linux**: AutoClaw 1.x reads the plaintext `request-headers.json`; AutoClaw 2.x (Electron) writes an encrypted vault and the proxy decrypts it itself — Windows via DPAPI, macOS via the login Keychain, Linux via the Secret Service / GNOME Keyring. Either way auth is automatic — no manual token copying. Node.js 18+ required on all platforms.
+- **Linux**: For Linux TLS compatibility matching AutoClaw's Electron fingerprint, ensure `curl_cffi` is installed (`pip install curl_cffi`).
 
 ---
 
@@ -54,13 +54,15 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
+Or let the proxy do it for you: run `glmproxy`, pick **Anthropic format**, and choose **Launch Claude Code with \<model\>**. The launcher writes a settings file into the proxy's state dir, passes it through `claude --settings` (feature-detected — older clients fall back to environment-only routing), waits for the gateway to answer `/healthz`, and then hands your terminal to the interactive client. The gateway stays up when Claude Code exits; `GLMP_CLAUDE_BIN` points the launcher at a different binary if `claude` is not on `PATH`.
+
 #### Supported Modes & Known Caveats:
 - **Claude Agent SDK & Direct API**: Fully supported. Direct `/v1/messages` calls, streaming SSE deltas, thinking blocks, and tool use execute cleanly without restrictions.
-- **Claude Code CLI (Print Mode)**: Works reliably for CLI tasks using the `-p` / non-interactive flag across Opus, Sonnet, and Haiku models:
+- **Claude Code CLI (interactive and print mode)**: Works. On AutoClaw 2.x the upstream's system-prompt gate rejects any prompt carrying a foreign harness signature, and Claude Code's own system prompt names itself — the proxy's identity guard (`GLMP_FOREIGN_IDENTITY_GUARD`, on by default) rewrites those phrases (`You are Claude Code`, `built on Anthropic's Claude Agent SDK`, …) before forwarding. Measured 2026-10-14 against Claude Code 2.1.296 with the client's own captured system block. Print mode:
   ```bash
   claude -p "Explain the codebase architecture"
   ```
-- **Interactive Mode Notice**: Running interactive `claude` sessions injects Claude Code's internal auto-mode security classifier prompt (a ~285 KB / 71,000+ token evaluation prompt with multi-tier session hooks) which triggers an upstream `HTTP 406 Not Acceptable` filter from AutoClaw. For interactive agentic sessions, use the OpenAI-compatible endpoint (`http://localhost:18791/v1`) with Cursor, OpenCode, or Continue, or run Claude Code in print mode (`-p`).
+  If you turn the guard off (`GLMP_FOREIGN_IDENTITY_GUARD=0`), Claude Code's unmodified prompt is answered with a bare `406` on 2.x — the guard is what makes the client quote work.
 
 ### OpenCode
 
@@ -198,6 +200,10 @@ On Linux, AutoClaw 2.0.3 natively exposes **4 models** in its upstream runtime c
 
 > **Platform Model Differences**: AutoClaw 2.0.3 AppImage on Linux natively provisions the 4 core ZAI models above in its runtime catalog. DeepSeek models (`tdpsk_*`) and `zai_glm-5-turbo` are served exclusively on Windows AutoClaw installations. The proxy dynamically inspects your environment and serves the correct model set at runtime.
 
+### macOS (AutoClaw 2.x)
+
+macOS reads the same AutoClaw 2.x runtime catalog the Linux build serves (discovered under `~/Library/Application Support/AutoClaw-oversea-official/`), so the model list above is the expected baseline; whatever the app's own snapshot contains is what `/v1/models` answers.
+
 The catalog is re-read dynamically from AutoClaw's runtime snapshot on every `/v1/models` call, degrading to the platform-appropriate fallback catalog if the snapshot is unreadable. Run `glmproxy --doctor` to inspect the current catalog after an AutoClaw update. Claude model names sent to the Anthropic proxy are mapped automatically:
 
 | Claude model | Routes to (Linux) | Routes to (Windows) |
@@ -222,7 +228,7 @@ GLM Proxy includes a built-in serialized FIFO in-flight queue (`InFlightQueue`):
 <details>
 <summary><h2>CLI reference</h2></summary>
 
-Running `glmproxy` with no flags on a real terminal opens an interactive menu: arrow keys to move, Enter to pick. Choose format, port, host, and auth key, or run **Model Doctor** / **Test Models** without starting a proxy. Ctrl+C quits cleanly and restores your terminal. Without a TTY (piped stdin, CI), the CLI skips the menu and starts the OpenAI format on port 18791 using your env vars or defaults.
+Running `glmproxy` with no flags on a real terminal opens an interactive menu: arrow keys to move, Enter to pick. Choose format, port, host, and auth key, or run **Model Doctor** / **Test Models** without starting a proxy. Choosing the Anthropic format also offers to launch Claude Code against the gateway you just configured (see [Claude Code CLI](#claude-code-cli--anthropic-api)). Ctrl+C quits cleanly and restores your terminal. Without a TTY (piped stdin, CI), the CLI skips the menu and starts the OpenAI format on port 18791 using your env vars or defaults.
 
 | Format | Flag | Default port | Use with |
 |--------|------|--------------|----------|
@@ -315,9 +321,10 @@ glmproxy --test-models
 | `GLMP_AUTOCLAW2` | auto-detected | Force `1` to treat this install as AutoClaw 2.x (encrypted vault) or `0` to force 1.x (legacy `request-headers.json`). Normally detected at startup from the presence of a 2.x vault; set it only when detection is wrong |
 | `GLMP_VAULT` | on (2.x only) | 2.x vault leg toggle. Auto-enabled when a 2.x vault is discovered; `GLMP_VAULT=0` forces the legacy `request-headers.json` path. No effect on 1.x |
 | `GLMP_AUTOCLAW_TOKEN` | unset | Direct JWT override. Short-circuits both the vault and the legacy file — for headless/CI where no app, keyring or DPAPI is present. In-memory only, never written to disk |
-| `GLMP_KEYRING_PASSWORD` | unset | OSCrypt master password for the **Linux** 2.x vault. Use in headless/CI; otherwise the proxy probes the desktop Secret Service (`org.freedesktop.secrets`). Never logged |
+| `GLMP_KEYRING_PASSWORD` | unset | OSCrypt master secret for the **Linux/macOS** 2.x vault (on macOS it is the Keychain password, and the same PBKDF2 is run at Chromium's macOS iteration count of 1003). Use in headless/CI; otherwise the proxy probes the desktop Secret Service (`org.freedesktop.secrets`) or the login Keychain. Never logged |
 | `GLMP_DPAPI_KEY` | unset | The **Windows** 2.x vault key: base64 of the raw 32-byte OSCrypt key. Normally not needed — the proxy unprotects `%APPDATA%\<product>\Local State` → `os_crypt.encrypted_key` with DPAPI itself (one cached PowerShell call). Set it for headless/CI, or when the vault is copied to another machine/user (DPAPI is per-user). Never logged |
-| `AUTOCLAW_USER_DATA_ROOT` | unset | Override the AutoClaw config root (parity with the app's own env var). The vault and runtime catalog resolve under this dir; defaults to `%APPDATA%\AutoClaw-oversea-official` (Windows) or `$XDG_CONFIG_HOME/AutoClaw` / `~/.config/AutoClaw` (Linux) |
+| `GLMP_CLAUDE_BIN` | unset | Path (or bare name, resolved on `PATH`) of the `claude` binary the CLI's **Launch Claude Code** option spawns. Discovery order without it: `PATH`, then `~/.claude/local` and `~/.local/bin`, then the system prefixes |
+| `AUTOCLAW_USER_DATA_ROOT` | unset | Override the AutoClaw config root (parity with the app's own env var). The vault and runtime catalog resolve under this dir; defaults to `%APPDATA%\AutoClaw-oversea-official` (Windows), `~/Library/Application Support/AutoClaw-oversea-official` (macOS), or `$XDG_CONFIG_HOME/AutoClaw` / `~/.config/AutoClaw` (Linux) |
 | `GLMP_USER_AGENT` | `node` (measured) | Override the upstream `User-Agent` header. The real client sends **`node`** — undici's stack default — because it publishes no UA of its own; a product-token UA would be a *more* distinctive signal than the truth, so this default is the faithful one |
 | `GLMP_ACCEPT` | `*/*` (measured) | Override the upstream `Accept` header. The app sets this to `*/*` |
 | `GLMP_HARNESS_TYPE` | `zcode` (1.x only) | The harness declaration the upstream's **system-prompt allowlist** accepts **on 1.x**. The 1.x app sends `X-Harness-Type: zcode` + `x_trace_id: autoclaw-desktop` on every model-proxy request (verbatim comment in the shipped bundle: *"Exempts zcode requests from api-proxy's system-prompt allowlist check"*), and it is probe-verified to satisfy that gate **on its own** — without it the upstream answers `400 invalid request` unless the prompt carries the banner. Ignored on 2.x: there the same header is answered with a bare `406` (empty body, request never reaches the application), the 2.x bundle contains that header name zero times, and the gate matches the app's own prompt text instead. Set to empty to send no declaration on 1.x |
@@ -587,7 +594,7 @@ TRUSTED_PROXIES=127.0.0.1 glmproxy --host 0.0.0.0
 - The cloud upstream requires AutoClaw's app system-prompt banner in every request. The proxy injects it automatically and never duplicates it. In practice it doesn't change much since your harness's own system prompt overrides it anyway
 - Max output is clamped to each model's real upstream cap (131K for every GLM model, 393K for DeepSeek). AutoClaw's runtime catalog overstates GLM-5.3's cap (307K), and asking the cloud for more than a model's real cap makes it **silently run a DeepSeek model instead and bill DeepSeek credits** — the proxy clamps so your `zai_glm-5.3` stays GLM-5.3
 - Images pass through natively: pasted/attached images (`image_url` data URLs, Anthropic `image` blocks) reach vision-capable models (e.g. `zai_glm-5.3-flash`) as real image parts — the model sees them directly, no OCR bridge.
-- The token file is watched for changes, so AutoClaw can rotate auth mid-session without a restart. On AutoClaw 2.x the proxy discovers the encrypted vault (`accounts/<id>/account-credentials.enc`), decrypts it in memory, and follows its rotation: Linux unlocks the Secret Service / GNOME Keyring master secret, Windows unprotects the OSCrypt key with DPAPI. Decrypted key material stays strictly in memory and is never written to disk. Headless or custom environments can set `AUTOCLAW_CONFIG_DIR` plus `GLMP_KEYRING_PASSWORD` (Linux) or `GLMP_DPAPI_KEY` (Windows).
+- The token file is watched for changes, so AutoClaw can rotate auth mid-session without a restart. On AutoClaw 2.x the proxy discovers the encrypted vault (`accounts/<id>/account-credentials.enc`), decrypts it in memory, and follows its rotation: Linux unlocks the Secret Service / GNOME Keyring master secret, Windows unprotects the OSCrypt key with DPAPI, macOS reads the master secret from the login Keychain. Decrypted key material stays strictly in memory and is never written to disk. Headless or custom environments can set `AUTOCLAW_CONFIG_DIR` plus `GLMP_KEYRING_PASSWORD` (Linux/macOS) or `GLMP_DPAPI_KEY` (Windows).
 - Upstream limits accounts to 1 concurrent generation: parallel requests from subagents or concurrent sessions are queued in-process in FIFO order, eliminating upstream 406 collisions. Client disconnects automatically abort in-flight upstream streams before releasing the queue slot.
 - AutoClaw's client identity (app version, platform, channel) loads dynamically from its runtime file, same as the model catalog, so an AutoClaw app update is picked up without editing or restarting the proxy
 - The fallback model catalog lives in `lib/fallback-models.json` (override with `FALLBACK_MODELS_PATH`). The built-in list is only a last resort when AutoClaw's runtime file is unreadable

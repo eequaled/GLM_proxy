@@ -37,10 +37,27 @@ jobs:
           echo "gha=${GITHUB_ACTIONS:-unset}"
 
       - name: Syntax checks
-        run: node --check openai.js && node --check anthropic.js && node --check lib/core.js && node --check lib/prompts.js && node --check bin/cli.js && node --check main.js
+        run: |
+          for f in lib/*.js openai.js anthropic.js main.js bin/cli.js; do
+            node --check "$f" || exit 1
+          done
 
-      - name: Unit tests (no upstream)
-        run: node tests/taxonomy.mjs
+      # The offline suites: no network, no credits, injected clock, TLS mock.
+      # Identical to the required CI gate — a tag must not publish a red tree.
+      - name: Offline suites (no upstream)
+        run: |
+          node tests/taxonomy.mjs
+          node tests/pen-test-p6.mjs
+          node tests/pen-test-p7.mjs
+          node tests/pen-test-p8.mjs
+          node tests/pen-test-p9.mjs
+          node tests/pen-test-p10.mjs
+          node tests/pen-test-p11.mjs
+          node tests/pen-test-p12.mjs
+          node tests/pen-test-p13.mjs
+          node tests/vault.mjs
+          node tests/secretservice.mjs
+          node tests/queue.mjs
 
       - name: Tag must match package.json version
         if: ${{ github.event_name == 'push' }} # only tag pushes; manual runs publish whatever version is in package.json

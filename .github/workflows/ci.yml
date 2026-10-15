@@ -31,8 +31,52 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
-      - run: node --check lib/core.js && node --check openai.js && node --check anthropic.js && node --check bin/cli.js && node --check main.js
+      - name: Syntax-check every module
+        run: |
+          for f in lib/*.js openai.js anthropic.js main.js bin/cli.js; do
+            node --check "$f" || exit 1
+          done
       - run: node tests/taxonomy.mjs
+
+  # Offline suites: no network, no credits — injected clock, TLS mock fixture,
+  # fake HOME. These are the release gate. The matrix deliberately crosses all
+  # three platforms because the vault roots, the OSCrypt KDF and the Claude Code
+  # launcher all branch on the host OS; the macOS leg (Application Support roots,
+  # PBKDF2 at 1003 iterations, a real `security` Keychain round-trip) is verified
+  # here and nowhere else.
+  offline-suites:
+    needs: unit-and-static
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node-version: 20
+          - os: ubuntu-latest
+            node-version: 24
+          - os: windows-latest
+            node-version: 24
+          - os: macos-latest
+            node-version: 24
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: node tests/taxonomy.mjs
+      - run: node tests/pen-test-p6.mjs
+      - run: node tests/pen-test-p7.mjs
+      - run: node tests/pen-test-p8.mjs
+      - run: node tests/pen-test-p9.mjs
+      - run: node tests/pen-test-p10.mjs
+      - run: node tests/pen-test-p11.mjs
+      - run: node tests/pen-test-p12.mjs
+      - run: node tests/pen-test-p13.mjs
+      - run: node tests/vault.mjs
+      - run: node tests/secretservice.mjs
+      - run: node tests/queue.mjs
 
   # Live-upstream suites: gated by cloud availability, so they run
   # continue-on-error and must never redden code PRs. Each uploads whatever
