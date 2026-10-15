@@ -13,6 +13,10 @@ import {
 } from "../lib/core.js";
 import { DEFAULT_PORTS, DEFAULT_HOST, DEFAULT_PROXY_KEY, TEST_PROXY_PORT } from "../lib/constants.js";
 import { describeTokenWindow } from "../lib/governor.js";
+import {
+  findClaudeBin, buildLaunchArgs, buildLaunchSettings, writeLaunchSettings,
+  detectSettingsFlag, waitForProxy, launchClaude, CLAUDE_BIN_ENV, LAUNCH_SETTINGS_FILE,
+} from "../lib/claude-code.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -489,6 +493,94 @@ if (maxMessagesIdx !== -1 && args[maxMessagesIdx + 1]) {
 
 const hasFlags = FLAGS.some((f) => args.includes(f));
 
+// ─── Claude Code launch (Anthropic surface) ─────────────────────────────────
+// Claude Code speaks /v1/messages, so the Anthropic surface is the one worth
+// offering a client launch for. The menu is the catalog itself: the id that is
+// picked is what `claude --model <id>` receives, and this proxy resolves it, so
+// the list the operator sees is the list that routes.
+let claudeLaunchModel = null;
+
+async function chooseClaudeLaunchModel(bin, models) {
+  const choices = models.map((m) => ({
+    name: `Launch Claude Code with ${m.id}${m.name && m.name !== m.id ? ` (${m.name})` : ""}`,
+    value: m.id,
+  }));
+  choices.push({
+    name: bin
+      ? "Run the Anthropic gateway only — no client launch"
+      : "Run the Anthropic gateway only — Claude Code is not installed",
+    value: "",
+  });
+  const hint = bin
+    ? `  ${COLORS.GRAY}claude: ${bin} — launched with --model, routed through this proxy${COLORS.RESET}`
+    : `  ${COLORS.GRAY}No claude on PATH. Install: npm i -g @anthropic-ai/claude-code`
+      + ` (or set ${CLAUDE_BIN_ENV} to the binary)${COLORS.RESET}`;
+  return promptSelect({
+    message: "Anthropic surface:",
+    hint,
+    choices,
+    default: bin && models.length ? models[0].id : "",
+  });
+}
+
+// Runs after the gateway is listening. The entrypoint is started in-process by
+// the import at the bottom of this file and `listen()` is asynchronous, so the
+// client waits for a real /healthz answer instead of racing the socket. Every
+// failure path here leaves the gateway up — the operator can always run claude
+// themselves.
+async function runClaudeLaunch({ model, host, port, key }) {
+  const baseUrl = `http://${host}:${port}`;
+  const bin = findClaudeBin();
+  console.log(`\n  ${COLORS.GRAY}Routing Claude Code to ${baseUrl} with model ${model}${COLORS.RESET}`);
+
+  if (!bin) {
+    console.log(`  ${COLORS.RED}✗ claude not found${COLORS.RESET} — install it with ${COLORS.CYAN}npm i -g @anthropic-ai/claude-code${COLORS.RESET},`);
+    console.log(`    or point ${COLORS.CYAN}${CLAUDE_BIN_ENV}${COLORS.RESET} at the binary. The gateway is running either way.\n`);
+    return;
+  }
+
+  const config = loadConfig({ format: "anthropic" });
+  let entry = null;
+  try { entry = getModelCatalog(config).models.find((m) => m.id === model) || null; }
+  catch (_) { entry = null; }
+
+  const settings = buildLaunchSettings({
+    baseUrl,
+    token: key,
+    model,
+    contextWindowTokens: entry?.contextWindow ?? null,
+  });
+
+  // `--settings` outranks the user's and the project's own settings files, which
+  // is the point: a settings.json `env` block beats the exported environment, so
+  // env alone would lose to a stale ANTHROPIC_BASE_URL. Clients that predate the
+  // flag still launch, on the environment alone.
+  const settingsSupported = await detectSettingsFlag({ bin });
+  const settingsFile = settingsSupported ? writeLaunchSettings(config.STATE_DIR, settings) : null;
+  if (!settingsSupported) {
+    console.log(`  ${COLORS.GRAY}This claude predates --settings: routing by environment only, so a`);
+    console.log(`  settings.json ANTHROPIC_BASE_URL would take precedence.${COLORS.RESET}`);
+  } else if (!settingsFile) {
+    console.log(`  ${COLORS.GRAY}Could not write ${LAUNCH_SETTINGS_FILE} into the state dir: routing by environment only.${COLORS.RESET}`);
+  }
+
+  const args = buildLaunchArgs({ model, settingsFile });
+  if (!(await waitForProxy({ baseUrl, token: key }))) {
+    console.log(`  ${COLORS.RED}✗ the gateway did not answer on ${baseUrl} — not launching Claude Code.${COLORS.RESET}\n`);
+    return;
+  }
+
+  console.log(`  ${COLORS.GRAY}${bin} ${args.join(" ")}${COLORS.RESET}\n`);
+  const result = await launchClaude({ bin, args, env: settings.env });
+  if (!result.started) {
+    console.log(`  ${COLORS.RED}✗ could not start claude: ${result.error?.message || "unknown error"}${COLORS.RESET}`);
+    console.log(`    The gateway is still running on ${baseUrl}.\n`);
+    return;
+  }
+  const how = result.code === null || result.code === undefined ? String(result.signal) : `code ${result.code}`;
+  console.log(`\n  ${COLORS.GRAY}claude exited (${how}). The gateway is still running on ${baseUrl} — Ctrl+C to stop it.${COLORS.RESET}\n`);
+}
+
 // Menu (only on a real TTY with no flags)
 if (!hasFlags && process.stdin.isTTY) {
   for (;;) {
@@ -565,6 +657,17 @@ if (!hasFlags && process.stdin.isTTY) {
     }
 
     isAnthropic = action === "start_anthropic";
+    if (isAnthropic) {
+      const bin = findClaudeBin();
+      // Only the ids the proxy actually serves are offered — an arbitrary string
+      // would still reach a model (the alias map falls back to the tier default)
+      // but it would not be the model the operator picked, which is worse than a
+      // shorter menu. Capped so the raw-mode menu stays readable.
+      let launchable = [];
+      try { launchable = getModelCatalog(loadConfig({ format: "anthropic" })).models.slice(0, 12); }
+      catch (_) { launchable = []; }
+      claudeLaunchModel = await chooseClaudeLaunchModel(bin, launchable);
+    }
     const defaultPort = DEFAULT_PORTS[isAnthropic ? "anthropic" : "openai"];
     const port = await promptNumber({ message: "Port:", default: defaultPort });
     const host = await promptInput({ message: "Host:", default: "127.0.0.1" });
@@ -583,3 +686,15 @@ const targetFile = isAnthropic
 
 // Windows dynamic imports need a file:// URL, not a raw drive-letter path
 await import(pathToFileURL(targetFile).href);
+
+// The gateway is listening in this process now; hand the terminal to Claude Code
+// if that is what was chosen. Deliberately after the import, never before: the
+// client dials /v1/messages the moment it starts.
+if (claudeLaunchModel) {
+  await runClaudeLaunch({
+    model: claudeLaunchModel,
+    host: process.env.HOST || DEFAULT_HOST,
+    port: Number(process.env.PORT) || DEFAULT_PORTS.anthropic,
+    key: process.env.PROXY_KEY || DEFAULT_PROXY_KEY,
+  });
+}
