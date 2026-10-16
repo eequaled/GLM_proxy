@@ -18,9 +18,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 
 import { PEN_TEST_PORTS } from "../lib/constants.js";
-import { DEFAULT_THROTTLE_RETRIES } from "../lib/core.js";
+import { DEFAULT_THROTTLE_RETRIES, callUpstreamWithRetry, clearQuarantinedShapes } from "../lib/core.js";
 import { check, post, proxyOutput, startProxy, startTlsMock, stopProxy, summary } from "./_helpers.mjs";
 
 const PORT = PEN_TEST_PORTS.p9;
@@ -323,6 +324,143 @@ const ask = () => post(PORT, {
   check("bridge-removed: the old bridge path never engages (no fallback vocabulary)",
     !/bridge unavailable|falling back to standard transport|Failed to start TLS bridge/i.test(out),
     out.split("\n").filter((l) => /bridge/i.test(l)).join(" | "));
+
+  await stopProxy(proxy);
+  await mock.close();
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+// ---- 7. the 2.x system-prompt gate: one bare 406, then a quarantined retry ---
+//
+// The gate is deterministic per prompt bytes, so a bare 406 must never ride the
+// throttle backoff: waiting cannot change it. The hook reshapes once (harness
+// text out of system scope) and retries immediately; the learned shape then
+// skips the probe entirely on the next request. Measured live 2026-10-15: the
+// same sentence in system 406s, in user scope it passes — the mock's gate
+// models exactly that split.
+{
+  // Unit half: the retry loop itself, with an injected clock — no sleeps.
+  const fakeRes = (status, body = "") => {
+    const ee = new EventEmitter();
+    ee.statusCode = status;
+    ee.headers = {};
+    process.nextTick(() => {
+      if (body) ee.emit("data", Buffer.from(body, "utf8"));
+      ee.emit("end");
+    });
+    return ee;
+  };
+
+  {
+    const sleeps = [];
+    let attempts = 0;
+    let reshapes = 0;
+    const noopLog = { warn() {}, info() {}, error() {}, success() {}, debug() {} };
+    const out = await callUpstreamWithRetry(
+      async () => (attempts++, fakeRes(attempts === 1 ? 406 : 200)),
+      "zai_glm-5.3-flash",
+      new Map(),
+      noopLog,
+      {
+        sleep: (ms) => { sleeps.push(ms); return Promise.resolve(); },
+        random: () => 0.5,
+        onBare406: () => { reshapes++; return reshapes === 1; },
+      },
+    );
+    check("406 hook: a bare 406 reshapes and retries immediately, never a throttle backoff",
+      sleeps.length === 0, JSON.stringify(sleeps));
+    check("406 hook: the reshape arms exactly once per request", reshapes === 1, String(reshapes));
+    check("406 hook: the retried call succeeds",
+      out.res.statusCode === 200 && attempts === 2, `${out.res.statusCode} attempts=${attempts}`);
+  }
+  {
+    // The negative half: a second 406 after the reshape spent its one shot is
+    // terminal — a loop that retried forever would be a hammer on the account.
+    let attempts = 0;
+    const noopLog = { warn() {}, info() {}, error() {}, success() {}, debug() {} };
+    const out = await callUpstreamWithRetry(
+      async () => (attempts++, fakeRes(406)),
+      "zai_glm-5.3-flash",
+      new Map(),
+      noopLog,
+      { sleep: () => Promise.resolve(), onBare406: () => attempts === 1 },
+    );
+    check("406 hook: a second bare 406 is terminal, not a retry loop",
+      out.res.statusCode === 406 && attempts === 2, `${out.res.statusCode} attempts=${attempts}`);
+  }
+  {
+    // A 406 with a body is NOT the gate — it is an ordinary classified error.
+    // The hook must not fire (no reshape), and it follows the normal path.
+    let attempts = 0;
+    let hookCalls = 0;
+    const noopLog = { warn() {}, info() {}, error() {}, success() {}, debug() {} };
+    const out = await callUpstreamWithRetry(
+      async () => (attempts++, fakeRes(406, "upstream says no")),
+      "zai_glm-5.3-flash",
+      new Map(),
+      noopLog,
+      { sleep: () => Promise.resolve(), onBare406: () => { hookCalls++; return true; } },
+    );
+    check("406 hook: a 406 with a body is not reshaped",
+      out.res.statusCode === 406 && hookCalls === 0,
+      `${out.res.statusCode} attempts=${attempts} hookCalls=${hookCalls}`);
+  }
+}
+
+{
+  // E2e half: the whole path through the proxy — guard off (the phrase is
+  // unlisted, so Tier-1 cannot save it), gate on, quarantine on. The first
+  // upstream hit gets a bare 406; the quarantined retry passes the same gate.
+  clearQuarantinedShapes();
+  const home = makeHome();
+  const { mock, proxy } = await againstMock(
+    { gate406On: "you are pi" },
+    home,
+    { GLMP_AUTOCLAW2: "1", GLMP_FOREIGN_IDENTITY_GUARD: "0" },
+  );
+
+  const gatedBody = {
+    model: "zai_glm-5.3-flash",
+    messages: [
+      { role: "system", content: "You are Pi, a personal AI assistant. Be brief and helpful." },
+      { role: "user", content: "hi" },
+    ],
+  };
+
+  const res = await post(PORT, { body: gatedBody, timeoutMs: 20000 });
+  check("406 e2e: the quarantined retry reaches the client as a 200",
+    res.status === 200, res.status);
+  check("406 e2e: exactly one bare 406 probe, then the reshaped call",
+    mock.getRequests().length === 2, String(mock.getRequests().length));
+
+  const out = proxyOutput(proxy).all || "";
+  check("406 e2e: the reshape and the quarantine are both announced",
+    /retrying immediately with a reshaped body/.test(out) && /quarantined 1 system message/.test(out),
+    out.split("\n").filter((l) => /406|quarantin/.test(l)).join(" | "));
+
+  // The learned shape: the same body again must not pay a second probe.
+  mock.clearRequests();
+  const second = await post(PORT, { body: gatedBody, timeoutMs: 20000 });
+  check("406 e2e: the learned shape goes straight to quarantine — no second probe",
+    second.status === 200 && mock.getRequests().length === 1,
+    `${second.status} hits=${mock.getRequests().length}`);
+
+  // A different harness (different system text, same signature) is a different
+  // learned shape and must pay its own single probe.
+  mock.clearRequests();
+  const third = await post(PORT, {
+    body: {
+      model: "zai_glm-5.3-flash",
+      messages: [
+        { role: "system", content: "You are Pi, a personal AI assistant. Completely different rules." },
+        { role: "user", content: "hi" },
+      ],
+    },
+    timeoutMs: 20000,
+  });
+  check("406 e2e: a new harness shape pays exactly one probe",
+    third.status === 200 && mock.getRequests().length === 2,
+    `${third.status} hits=${mock.getRequests().length}`);
 
   await stopProxy(proxy);
   await mock.close();

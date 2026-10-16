@@ -23,6 +23,19 @@ function sseText(scenario) {
   ].join("");
 }
 
+// Text the 2.x prompt gate actually judges: system-role messages only. The
+// gate is system-scoped (measured live 2026-10-15: a denylisted sentence in a
+// user message returns 200, in system returns a bare 406), so this models the
+// verdict faithfully.
+function systemTextOf(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((p) => (typeof p === "string" ? p : (p?.type === "text" && typeof p?.text === "string" ? p.text : "")))
+    .filter(Boolean)
+    .join("\n");
+}
+
 /**
  * Encode a body the way a real intermediary would.
  *
@@ -168,6 +181,26 @@ export function createMockUpstream(initialScenario = {}) {
           ...(scenario.cookie ? { "set-cookie": scenario.cookie } : {}),
         }, JSON.stringify({ code: 429001, message: "Rate limit exceeded" }));
         return;
+      }
+
+      // 2.x system-prompt gate model: a bare 406 (empty body) when the system
+      // prompt carries the named foreign signature — even with the vendor
+      // banner present. `gate406On` is the lowercase signature; anything else
+      // falls through to the normal 200, which is what the proxy's quarantine
+      // relies on: move the text out of system and the identical gate passes.
+      if (scenario.gate406On && url.includes("chat/completions")) {
+        let judged = "";
+        try {
+          const parsed = JSON.parse(rawBody);
+          for (const m of parsed.messages || []) {
+            if (m && m.role === "system") judged += `\n${systemTextOf(m.content)}`;
+          }
+        } catch { /* unparseable body is not a gate case — fall through */ }
+        if (judged.toLowerCase().includes(String(scenario.gate406On).toLowerCase())) {
+          res.writeHead(406, { "content-length": "0" });
+          res.end();
+          return;
+        }
       }
 
       // Custom status / response

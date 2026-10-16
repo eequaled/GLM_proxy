@@ -25,7 +25,7 @@ import {
   readBody, validateChatPayload, generateId,
   SSE_HEADERS, validateModelField, lastMessagePreview,
   logUpstreamErrorBody, callUpstreamWithInvalidRequestRetry,
-  callUpstreamAnthropic,
+  callUpstreamAnthropic, quarantineForRequest,
   classifyUpstreamError, classifyTransportError,
   createPermanentFailureCache,
   fetchRemoteModelConfig, annotateCreditTiers, resolveTierTargets,
@@ -255,9 +255,12 @@ async function handleMessages(req, res) {
 
     // Cloud call with one retry on the flaky 400 "invalid request" hiccup;
     // every >=400 body is buffered + logged (R1). Shared with openai.js.
+    // The quarantine controller arms the universal fallback (see openai.js):
+    // a bare 406 rebuilds the body with the harness text out of system scope.
+    const qc = quarantineForRequest(config, log, openAIBody);
     const { res: upstreamRes, errBody: upstreamErrBody } = await callUpstreamWithInvalidRequestRetry(
-      () => callUpstreamAnthropic(config, getClientHeaders(config), getToken, openAIBody, modelId, null, log),
-      modelId, permanentFailures, log,
+      () => callUpstreamAnthropic(config, getClientHeaders(config), getToken, openAIBody, modelId, null, log, qc.buildOpts()),
+      modelId, permanentFailures, log, qc.retryOpts(),
     );
 
     const statusCode = upstreamRes.statusCode;

@@ -17,6 +17,7 @@ import { createIdentityLayer, IDENTITY_SNAPSHOT_FILE } from "../lib/identity.js"
 import {
   BANNER_SNAPSHOT_FILE, COMPACTION_MARKER, PINNED_BANNER, PINNED_BANNER_2X,
   BANNER_ANCHOR_2X, extractBannerFrom, neutralizeForeignIdentities,
+  harnessSystemText, quarantineSystemPrompt, QUARANTINE_LEAD, QUARANTINE_SEP,
 } from "../lib/shape.js";
 
 const RUNTIME_NAME = "openclaw.runtime.json";
@@ -276,7 +277,7 @@ function writePromptConfigFixture(dir) {
 const CLEAN_SHAPE_ENV = {
   GLMP_GATEWAY_DIST: undefined, AUTOCLAW_SYSTEM_BANNER: undefined,
   PROMPT_ENVELOPE_KB: undefined, TOOL_SHAPE_BLOCKLIST: undefined,
-  GLMP_FOREIGN_IDENTITY_GUARD: undefined,
+  GLMP_FOREIGN_IDENTITY_GUARD: undefined, GLMP_SYSTEM_QUARANTINE: undefined,
 };
 
 // Point discovery at a path that does not exist. The gateway-dist roots come from
@@ -634,6 +635,145 @@ check("shape: a file without the anchor yields no banner instead of a guess",
       check("shape: GLMP_FOREIGN_IDENTITY_GUARD=0 disables the rewrite",
         out.messages[0].content.includes("You are Claude Code") && out.neutralizedIdentities.length === 0,
         out.messages[0].content.slice(0, 100));
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// System quarantine — the universal answer to the 2.x denylist (Tier-2).
+// Measured live 2026-10-15: a known-denylisted sentence in a user message
+// returns 200 while the same sentence in system returns a bare 406, so the
+// gate is system-scoped and moving the harness text out of system passes any
+// harness, measured or not. "You are Pi" is the stand-in for every unlisted
+// harness here: no entry in FOREIGN_IDENTITY_PHRASES matches it.
+// ---------------------------------------------------------------------------
+{
+  const pi = "You are Pi, a personal AI assistant. Be brief and helpful.";
+  check("shape: the stand-in harness really is unlisted (else this block proves nothing)",
+    neutralizeForeignIdentities(pi).hits.length === 0, JSON.stringify(neutralizeForeignIdentities(pi).hits));
+
+  check("shape: harnessSystemText concatenates every system message, nothing else",
+    harnessSystemText([
+      { role: "system", content: pi },
+      { role: "user", content: "hi" },
+      { role: "system", content: [{ type: "text", text: "More rules." }, { type: "image_url", image_url: { url: "https://x.invalid/i.png" } }] },
+    ]) === `${pi}\n\nMore rules.`,
+    harnessSystemText([{ role: "system", content: pi }]).slice(0, 80));
+
+  const frozen = [
+    { role: "system", content: `${PINNED_BANNER_2X}\n\n${pi}` },
+    { role: "user", content: "hi" },
+  ];
+  const before = JSON.stringify(frozen);
+  const cap = captureLog();
+  const q = quarantineSystemPrompt(frozen, PINNED_BANNER_2X, cap.log);
+  check("shape: quarantine leaves system carrying the vendor banner only",
+    q.messages[0].role === "system" && q.messages[0].content === PINNED_BANNER_2X,
+    JSON.stringify(q.messages[0].content).slice(0, 120));
+  const grafted = q.messages[1].content;
+  check("shape: the harness text is grafted onto the first user message, framed and verbatim",
+    q.messages[1].role === "user" && typeof grafted === "string"
+    && grafted.startsWith(QUARANTINE_LEAD) && grafted.includes(pi)
+    && grafted.includes(QUARANTINE_SEP) && grafted.endsWith("hi"),
+    String(grafted).slice(0, 200));
+  check("shape: quarantine reports what it moved",
+    q.quarantined === true && q.movedBytes > 0 && q.systemMessages === 1,
+    JSON.stringify({ quarantined: q.quarantined, movedBytes: q.movedBytes }));
+  check("shape: the quarantine is announced, never silent",
+    cap.infos.some((i) => /quarantined 1 system message/.test(i)), cap.infos.join(" | "));
+  check("shape: quarantine is pure — the client's own body is not mutated",
+    JSON.stringify(frozen) === before, "the input messages changed");
+
+  // Array-content user message with an image: the graft prepends a text part,
+  // the image part stays exactly where the harness put it.
+  const img = { type: "image_url", image_url: { url: "https://x.invalid/i.png" } };
+  const qArr = quarantineSystemPrompt(
+    [{ role: "system", content: `${PINNED_BANNER_2X}\n\n${pi}` },
+     { role: "user", content: [{ type: "text", text: "hi" }, img] }],
+    PINNED_BANNER_2X, captureLog().log);
+  check("shape: quarantine reaches array-content user messages without touching images",
+    Array.isArray(qArr.messages[1].content)
+    && qArr.messages[1].content[0]?.type === "text"
+    && qArr.messages[1].content[0].text.includes(pi)
+    && qArr.messages[1].content.some((p) => p === img),
+    JSON.stringify(qArr.messages[1].content).slice(0, 160));
+
+  // Multimodal system: the image cannot match a text denylist, so it stays in
+  // system beside the banner while the text moves.
+  const qImg = quarantineSystemPrompt(
+    [{ role: "system", content: [{ type: "text", text: `${PINNED_BANNER_2X}\n\n${pi}` }, img] },
+     { role: "user", content: "hi" }],
+    PINNED_BANNER_2X, captureLog().log);
+  const sysParts = qImg.messages[0].content;
+  check("shape: a system image part stays in system beside the banner",
+    Array.isArray(sysParts) && sysParts[0]?.text === PINNED_BANNER_2X && sysParts.some((p) => p === img),
+    JSON.stringify(sysParts).slice(0, 160));
+  check("shape: the system text still moves when an image stays behind",
+    qImg.quarantined === true && qImg.messages[1].content.includes(pi),
+    String(qImg.messages[1].content).slice(0, 120));
+
+  // Degenerate inputs: no user message, banner-only system, no system at all.
+  const qNoUser = quarantineSystemPrompt(
+    [{ role: "system", content: `${PINNED_BANNER_2X}\n\n${pi}` }],
+    PINNED_BANNER_2X, captureLog().log);
+  check("shape: without a user message the graft becomes one",
+    qNoUser.quarantined === true && qNoUser.messages.length === 2
+    && qNoUser.messages[1].role === "user" && qNoUser.messages[1].content.includes(pi),
+    JSON.stringify(qNoUser.messages.map((m) => m.role)));
+  const qBare = quarantineSystemPrompt(
+    [{ role: "system", content: PINNED_BANNER_2X }, { role: "user", content: "hi" }],
+    PINNED_BANNER_2X, captureLog().log);
+  check("shape: a banner-only system is already quarantined — nothing moves",
+    qBare.quarantined === false && qBare.movedBytes === 0
+    && qBare.messages[1].content === "hi",
+    JSON.stringify(qBare.messages[1].content));
+  const qNone = quarantineSystemPrompt([{ role: "user", content: "hi" }], PINNED_BANNER_2X, captureLog().log);
+  check("shape: with no system message the banner is still established",
+    qNone.quarantined === false && qNone.messages[0].content === PINNED_BANNER_2X
+    && qNone.messages[1].content === "hi",
+    JSON.stringify(qNone.messages.map((m) => [m.role, String(m.content).slice(0, 40)])));
+
+  // Two system messages collapse into one banner-only system, texts joined.
+  const qTwo = quarantineSystemPrompt(
+    [{ role: "system", content: `${PINNED_BANNER_2X}\n\nFirst rules.` },
+     { role: "system", content: "Second rules." },
+     { role: "user", content: "hi" }],
+    PINNED_BANNER_2X, captureLog().log);
+  check("shape: every system message leaves scope, texts joined in order",
+    qTwo.systemMessages === 2
+    && qTwo.messages.filter((m) => m.role === "system").length === 1
+    && qTwo.messages[1].content.includes("First rules.")
+    && qTwo.messages[1].content.indexOf("First rules.") < qTwo.messages[1].content.indexOf("Second rules."),
+    qTwo.messages[1].content.slice(0, 200));
+}
+
+{
+  const home = makeHome();
+  await withHome(home, async () => {
+    await withEnv({ ...NO_INSTALL(home), GLMP_AUTOCLAW2: "1" }, async () => {
+      const config = loadConfig({ format: "openai" });
+      check("shape: GLMP_SYSTEM_QUARANTINE defaults on",
+        config.SYSTEM_QUARANTINE === true, String(config.SYSTEM_QUARANTINE));
+      const layer = getShapeLayer(config, captureLog().log);
+      const pi = "You are Pi, a personal AI assistant. Be brief and helpful.";
+      const out = layer.apply(
+        [{ role: "system", content: pi }, { role: "user", content: "hi" }], [], { quarantine: true });
+      check("shape: apply quarantines end to end — banner-only system, grafted user",
+        out.messages[0].content === PINNED_BANNER_2X
+        && out.messages[1].content.includes(pi) && out.messages[1].content.endsWith("hi"),
+        out.messages[1].content.slice(0, 160));
+      check("shape: apply reports the quarantine",
+        out.quarantined === true && out.quarantinedBytes > 0,
+        JSON.stringify({ quarantined: out.quarantined, quarantinedBytes: out.quarantinedBytes }));
+      const plain = layer.apply([{ role: "system", content: pi }, { role: "user", content: "hi" }], []);
+      check("shape: quarantine is opt-in per request — the normal path is untouched",
+        plain.quarantined === false && plain.messages[0].content.includes("You are Pi"),
+        plain.messages[0].content.slice(0, 120));
+    });
+    await withEnv({ ...NO_INSTALL(home), GLMP_AUTOCLAW2: "1", GLMP_SYSTEM_QUARANTINE: "0" }, async () => {
+      const config = loadConfig({ format: "openai" });
+      check("shape: GLMP_SYSTEM_QUARANTINE=0 disables the fallback",
+        config.SYSTEM_QUARANTINE === false, String(config.SYSTEM_QUARANTINE));
     });
   });
 }
