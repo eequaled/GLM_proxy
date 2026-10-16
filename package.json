@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "glmproxy",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "description": "Local OpenAI- & Anthropic-compatible proxy for AutoClaw's Zhipu GLM-5.3 / GLM-5 / DeepSeek models",
   "main": "openai.js",
   "type": "module",
