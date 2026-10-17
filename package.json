@@ -1,7 +1,7 @@
 ﻿{
   "name": "glmproxy",
   "version": "3.3.0",
-  "description": "Local OpenAI- & Anthropic-compatible proxy for AutoClaw's Zhipu GLM-5.3 / GLM-5 / DeepSeek models",
+  "description": "Local OpenAI-compatible and Anthropic Messages API proxy for AutoClaw's Zhipu AI GLM and DeepSeek models",
   "main": "openai.js",
   "type": "module",
   "bin": {
@@ -25,31 +25,42 @@
   },
   "keywords": [
     "glm",
+    "glm-proxy",
+    "glmproxy",
     "glm-5",
     "glm-5.3",
     "glm-5-turbo",
+    "glm-5.3-flash",
     "zhipu",
+    "zhipu-ai",
     "zai",
     "autoclaw",
     "openai",
+    "openai-api",
     "openai-compatible",
     "anthropic",
+    "anthropic-messages",
+    "chat-completions",
+    "api-proxy",
     "proxy",
     "gateway",
     "opencode",
     "claude-code",
+    "cursor",
+    "continue",
+    "litellm",
     "deepseek",
-    "local",
+    "nodejs",
     "llm"
   ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/eequaled/GLM_proxy.git"
+    "url": "git+https://github.com/eequaled/GLMproxy.git"
   },
-  "homepage": "https://github.com/eequaled/GLM_proxy",
+  "homepage": "https://github.com/eequaled/GLMproxy",
   "bugs": {
-    "url": "https://github.com/eequaled/GLM_proxy/issues"
+    "url": "https://github.com/eequaled/GLMproxy/issues"
   },
   "publishConfig": {
     "access": "public"

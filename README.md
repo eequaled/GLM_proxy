@@ -1,9 +1,6 @@
-# GLM Proxy
+# GLM Proxy for AutoClaw
 
-<p align="center">
-  <b>Use your AutoClaw GLM models in any tool that speaks the OpenAI or Anthropic API</b><br>
-  <sub>Claude Code, Cursor, Continue, OpenCode, LiteLLM, raw SDKs. Point them here instead.</sub>
-</p>
+**GLM Proxy (`glmproxy`)** is a local Node.js API proxy for AutoClaw's Zhipu AI GLM models. It exposes OpenAI-compatible Chat Completions and Anthropic Messages APIs, so you can use AutoClaw models with Claude Code, Cursor, Continue, OpenCode, LiteLLM, and OpenAI or Anthropic SDKs on Windows, macOS, and Linux.
 
 <p align="center">
   <img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen" alt="Node.js >=18">
@@ -11,10 +8,10 @@
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey" alt="Platform">
   <img src="https://img.shields.io/npm/v/glmproxy" alt="npm version">
   <img src="https://img.shields.io/npm/dm/glmproxy" alt="npm downloads">
-  <img src="https://github.com/eequaled/GLM_proxy/actions/workflows/ci.yml/badge.svg" alt="CI">
+  <img src="https://github.com/eequaled/GLMproxy/actions/workflows/ci.yml/badge.svg" alt="CI">
 </p>
 
-<p align="center"><sub>v3.2.0. One CLI, two API formats, zero dependencies.</sub></p>
+<p align="center"><sub>v3.3.0. One CLI, two API formats, zero npm dependencies.</sub></p>
 
 ---
 

@@ -75,7 +75,7 @@ jobs:
       # Trusted publishing: npm exchanges the workflow's OIDC token for a
       # short-lived publish credential — no NPM_TOKEN secret, no OTP, and
       # provenance is generated automatically. Configured on npmjs.com under
-      # Package settings → Trusted Publisher (repo: eequaled/GLM_proxy,
+      # Package settings → Trusted Publisher (repo: eequaled/GLMproxy,
       # workflow: release.yml, action: npm publish).
       # --loglevel verbose surfaces the OIDC exchange rejection reason (the
       # oidc module logs it at verbose; ENEEDAUTH alone is misleading).
